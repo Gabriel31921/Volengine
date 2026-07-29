@@ -1,7 +1,7 @@
 [project]
 name = "volengine"
 version = "0.1.0"
-description = "Motor de calibración de superficies de volatilidad en tiempo real, multi-mercado"
+description = "Real-time, multi-market implied volatility surface calibration engine"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
@@ -41,9 +41,9 @@ packages = ["src/volengine"]
 testpaths = ["tests"]
 asyncio_mode = "auto"
 markers = [
-    "contract: calibradores intercambiables tras el mismo puerto",
-    "no_recompilation: guardián de ADR-009 (contador de compilaciones JAX)",
-    "e2e: pipeline completo de punta a punta",
+    "contract: interchangeable calibrators behind the same port",
+    "no_recompilation: ADR-009 guard (JAX compilation counter)",
+    "e2e: full end-to-end pipeline",
 ]
 
 [tool.ruff]

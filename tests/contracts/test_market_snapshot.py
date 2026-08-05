@@ -205,6 +205,26 @@ def test_quality_rejects_coverage_out_of_range(bad: float) -> None:
         replace(make_quality(), coverage_ratio=bad)
 
 
+def test_quality_rejects_negative_max_age() -> None:
+    with pytest.raises(ValueError, match="negative"):
+        replace(make_quality(), max_age_seconds=-1.0)
+
+
+def test_quality_rejects_negative_total_quotes() -> None:
+    with pytest.raises(ValueError, match="negative"):
+        replace(make_quality(), n_quotes_total=-1)
+
+
+def test_quality_rejects_negative_admissible_quotes() -> None:
+    with pytest.raises(ValueError, match="negative"):
+        replace(make_quality(), n_quotes_admissible=-1)
+
+
+def test_quality_rejects_negative_forward_crosscheck_error() -> None:
+    with pytest.raises(ValueError, match="negative"):
+        replace(make_quality(), forward_crosscheck_error=-0.01)
+
+
 def test_quality_rejects_more_admissible_than_total() -> None:
     with pytest.raises(ValueError, match="admissible"):
         replace(make_quality(), n_quotes_admissible=200, n_quotes_total=194)

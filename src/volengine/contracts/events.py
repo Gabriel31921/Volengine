@@ -21,8 +21,7 @@ class SurfaceCalibrated:
 class ChainCompositionChanged:
     market_id: str
     ts: datetime
-    added: tuple[str, ...]
-    removed: tuple[str, ...]
+    instruments: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)

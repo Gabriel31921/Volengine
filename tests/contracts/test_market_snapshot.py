@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from tests.support import replace_field
 from volengine.contracts.market_snapshot import (
     SCHEMA_VERSION,
     MarketSnapshot,
@@ -179,7 +180,7 @@ def test_slice_rejects_naive_expiry() -> None:
 def test_snapshot_rejects_naive_timestamps(field: str) -> None:
     naive = datetime(2026, 7, 27, 8, 0)
     with pytest.raises(ValueError, match=field):
-        replace(make_snapshot(), **{field: naive})
+        replace_field(make_snapshot(), field, naive)
 
 
 def test_snapshot_rejects_empty_market_id() -> None:

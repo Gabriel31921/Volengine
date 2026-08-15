@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from tests.support import replace_field
 from volengine.contracts.calibrated_surface import (
     SCHEMA_VERSION,
     CalibratedSurface,
@@ -248,7 +249,7 @@ def test_fit_rejects_invalid_individual_metrics(
     message: str,
 ) -> None:
     with pytest.raises(ValueError, match=message):
-        replace(make_fit(), **{field: bad_value})
+        replace_field(make_fit(), field, bad_value)
 
 
 def test_fit_rejects_rmse_greater_than_maximum_error() -> None:
@@ -271,7 +272,7 @@ def test_fit_dict_round_trip() -> None:
 )
 def test_surface_rejects_empty_identifiers(field: str) -> None:
     with pytest.raises(ValueError, match=rf"The {field} must not be empty"):
-        replace(make_surface(), **{field: ""})
+        replace_field(make_surface(), field, "")
 
 
 @pytest.mark.parametrize("field", ["ts_snapshot", "ts_calibrated"])
@@ -279,7 +280,7 @@ def test_surface_rejects_naive_timestamps(field: str) -> None:
     naive = TS.replace(tzinfo=None)
 
     with pytest.raises(ValueError, match=rf"{field} must be timezone-aware"):
-        replace(make_surface(), **{field: naive})
+        replace_field(make_surface(), field, naive)
 
 
 def test_surface_allows_calibration_at_the_snapshot_time() -> None:

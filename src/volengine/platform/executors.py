@@ -1,3 +1,11 @@
+"""Thread pools that keep two calibrators from contending for the same queue (ADR-005).
+
+Everything in this engine runs on one asyncio event loop, and a calibration is the one thing
+that would block it for a meaningful time. Pushing that work to threads keeps ingestion
+responsive; giving each producer its own pool keeps their latencies attributable, which is
+the measurement the whole project turns on.
+"""
+
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
@@ -37,6 +45,13 @@ class NamedExecutors:
         return pool
 
     def shutdown(self, wait: bool = True) -> None:
+        """Close every pool and forget them.
+
+        Args:
+            wait: Let running calibrations finish first. Leave it true on a normal stop --
+                a fit killed mid-flight leaves the producer's warm-start state torn between
+                two snapshots, and the next start would resume from it.
+        """
         for pool in self._pools.values():
             pool.shutdown(wait=wait)
         self._pools.clear()

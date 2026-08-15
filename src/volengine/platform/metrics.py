@@ -1,3 +1,19 @@
+"""Observability as a port, so the domain never chooses a destination.
+
+``logging`` is banned in the domain layers, and this is what replaces it. The difference is
+not cosmetic: a logger makes a module decide on a format, a level and a sink, three things
+that have nothing to do with volatility surfaces and that a test then has to work around.
+A ``MetricsSink`` lets a module state *what* it observed and stop there.
+
+The other half of the reason is that these measurements are the experiment. Whether the
+neural calibrator is competitive with SVI is answered by RMSE, latency and failure counts
+over a long run -- so the numbers have to be structured and taggable from day one, not parsed
+back out of log prose later.
+
+Each context declares its own ``MetricsSink`` protocol; the implementations here satisfy it
+structurally, with no import in either direction.
+"""
+
 from __future__ import annotations
 
 import logging

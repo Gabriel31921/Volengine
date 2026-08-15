@@ -26,6 +26,8 @@ from enum import StrEnum
 from itertools import pairwise
 from typing import Any, Final
 
+from volengine.shared_kernel.domain.instants import require_aware
+
 SCHEMA_VERSION: Final[int] = 1
 
 
@@ -183,7 +185,7 @@ class SliceData:
             raise ValueError(f"The tenor years must be positive, got {self.tenor_years}")
         if self.forward <= 0 or not math.isfinite(self.forward):
             raise ValueError(f"The forward must be positive, got {self.forward}")
-        _require_aware(self.expiry, "expiry")
+        require_aware(self.expiry, "expiry")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -357,8 +359,8 @@ class MarketSnapshot:
     def __post_init__(self) -> None:
         if not self.market_id:
             raise ValueError(f"The market id of the snapshot must exist, got {self.market_id}")
-        _require_aware(self.ts_exchange, "ts_exchange")
-        _require_aware(self.ts_local, "ts_local")
+        require_aware(self.ts_exchange, "ts_exchange")
+        require_aware(self.ts_local, "ts_local")
         if not all(a.expiry < b.expiry for a, b in pairwise(self.slices)):
             raise ValueError("slices must be sorted by expiry")
 
@@ -401,13 +403,3 @@ class MarketSnapshot:
             quality=QualityBlock.from_dict(raw["quality"]),
             schema_version=version,
         )
-
-
-def _require_aware(ts: datetime, field: str) -> None:
-    """Reject a naive datetime at construction, where the offending field is still known.
-
-    Deferred, the failure surfaces as a ``TypeError`` inside an unrelated subtraction, far
-    from the code that built the bad value.
-    """
-    if ts.tzinfo is None:
-        raise ValueError(f"{field} must be timezone-aware, got naive {ts}")

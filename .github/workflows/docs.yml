@@ -1,0 +1,59 @@
+name: docs
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Least privilege: the job may read the code, write a Pages deployment, and mint the
+# OIDC token deploy-pages authenticates with. It cannot push to the repository.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deployment at a time. Not cancel-in-progress: a half-finished deploy would leave
+# the published site in an undefined state, so a queued run waits instead.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      # Installs the Python pinned by requires-python and the locked dependencies.
+      # pdoc imports the package to read its docstrings, so numpy, scipy and typer
+      # have to be present; jax and torch are optional extras and stay out.
+      - name: Sync the environment
+        run: uv sync --frozen
+
+      - name: Build the docs
+        run: >
+          uv run --with pdoc pdoc
+          --output-directory _docs
+          --edit-url volengine=https://github.com/Gabriel31921/Volengine/blob/main/src/volengine/
+          --footer-text "volengine — implied volatility surface calibration engine"
+          volengine
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _docs
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

@@ -193,9 +193,7 @@ async def test_drops_are_attributed_to_the_subscriber_that_fell_behind() -> None
     await fast.receive()  # only the fast one drains its mailbox
     bus.publish(TOPIC, tick("second"))
 
-    assert metrics.tags_of("bus.dropped") == [
-        {"topic": TOPIC, "subscriber": "slow-calibrator"}
-    ]
+    assert metrics.tags_of("bus.dropped") == [{"topic": TOPIC, "subscriber": "slow-calibrator"}]
     assert marker_of(await slow.receive()) == "second"
 
 

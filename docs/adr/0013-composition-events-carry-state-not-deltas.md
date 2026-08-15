@@ -26,7 +26,7 @@ consumer that wants to know what changed compares against the set it already had
 class ChainCompositionChanged:
     market_id: str
     ts: datetime
-    instruments: tuple[str, ...]     # every live instrument, sorted
+    instruments: tuple[str, ...]  # every live instrument, sorted
 ```
 
 ## Alternatives considered

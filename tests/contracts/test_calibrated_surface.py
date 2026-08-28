@@ -23,6 +23,12 @@ CALIBRATED_AT = TS + timedelta(milliseconds=120)
 K_AXIS = (-0.2, -0.1, 0.0, 0.1, 0.2)
 T_AXIS = (30 / 365.0, 90 / 365.0, 1.0)
 
+# The expiry each tenor node stands for, and the forward at each. Carried rather than derived:
+# recomputing an expiry from a year fraction is a daycount assumption (ADR-002), and a moneyness
+# axis without its forwards is a coordinate system with no origin.
+EXPIRIES = (TS + timedelta(days=30), TS + timedelta(days=90), TS + timedelta(days=365))
+FORWARDS = (60_000.0, 60_400.0, 61_000.0)
+
 
 # --- builders
 # One valid object per class, with a single knob per test. A test that needs an
@@ -43,12 +49,16 @@ def _smile(tenor: float, log_moneyness: tuple[float, ...]) -> tuple[float, ...]:
 def make_grid(
     log_moneyness: tuple[float, ...] = K_AXIS,
     tenors: tuple[float, ...] = T_AXIS,
+    expiries: tuple[datetime, ...] = EXPIRIES,
+    forwards: tuple[float, ...] = FORWARDS,
     vols: tuple[tuple[float, ...], ...] | None = None,
 ) -> VolGrid:
     """Coherent by default; pass `vols` explicitly to build a ragged or negative grid."""
     return VolGrid(
         log_moneyness=log_moneyness,
         tenors=tenors,
+        expiries=expiries,
+        forwards=forwards,
         vols=vols if vols is not None else tuple(_smile(t, log_moneyness) for t in tenors),
     )
 
@@ -101,9 +111,44 @@ def test_surface_status_has_stable_wire_values(
 
 
 def test_grid_accepts_a_single_tenor_and_moneyness_node() -> None:
-    grid = make_grid(log_moneyness=(0.0,), tenors=(1.0,))
+    grid = make_grid(
+        log_moneyness=(0.0,),
+        tenors=(1.0,),
+        expiries=(EXPIRIES[-1],),
+        forwards=(FORWARDS[-1],),
+    )
 
     assert grid.vols == ((0.6,),)
+
+
+def test_grid_rejects_one_expiry_too_few() -> None:
+    """The expiries are read positionally against the tenors: a short tuple is a silent shift."""
+    with pytest.raises(ValueError, match="one expiry per tenor"):
+        make_grid(expiries=EXPIRIES[:2])
+
+
+def test_grid_rejects_one_forward_too_few() -> None:
+    with pytest.raises(ValueError, match="one forward per tenor"):
+        make_grid(forwards=FORWARDS[:2])
+
+
+def test_grid_rejects_a_naive_expiry() -> None:
+    """Staleness and time to expiry are subtractions; a naive value raises far from here."""
+    with pytest.raises(ValueError, match="timezone-aware"):
+        make_grid(expiries=(EXPIRIES[0].replace(tzinfo=None), EXPIRIES[1], EXPIRIES[2]))
+
+
+def test_grid_rejects_expiries_out_of_order() -> None:
+    """They stand for the tenor axis, which is increasing; a swap would pair a smile wrongly."""
+    with pytest.raises(ValueError, match="strictly increasing"):
+        make_grid(expiries=(EXPIRIES[1], EXPIRIES[0], EXPIRIES[2]))
+
+
+@pytest.mark.parametrize("bad", [0.0, -1.0, float("nan"), float("inf")])
+def test_grid_rejects_an_unusable_forward(bad: float) -> None:
+    """NaN is in the list on purpose: `nan <= 0` is False, so an ordering guard alone misses it."""
+    with pytest.raises(ValueError, match="forward must be positive and finite"):
+        make_grid(forwards=(FORWARDS[0], bad, FORWARDS[2]))
 
 
 def test_grid_rejects_an_empty_tenor_axis() -> None:
@@ -196,6 +241,8 @@ def test_grid_dict_round_trip_uses_json_friendly_lists() -> None:
     grid = VolGrid(
         log_moneyness=(-0.1, 0.1),
         tenors=(0.5,),
+        expiries=(EXPIRIES[1],),
+        forwards=(60_400.0,),
         vols=((0.4, 0.45),),
     )
 
@@ -204,8 +251,13 @@ def test_grid_dict_round_trip_uses_json_friendly_lists() -> None:
     assert raw == {
         "log_moneyness": [-0.1, 0.1],
         "tenors": [0.5],
+        # A datetime is not JSON-native, so the expiries cross the wire as ISO strings: the bus
+        # must not assume shared memory (ADR-003).
+        "expiries": ["2026-10-25T08:00:00+00:00"],
+        "forwards": [60_400.0],
         "vols": [[0.4, 0.45]],
     }
+    assert json.loads(json.dumps(raw)) == raw
     assert VolGrid.from_dict(raw) == grid
 
 

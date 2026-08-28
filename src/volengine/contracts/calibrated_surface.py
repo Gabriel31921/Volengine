@@ -87,6 +87,35 @@ class VolGrid:
     recomputes it from dates.
     """
 
+    expiries: tuple[datetime, ...]
+    """The expiry instant each tenor node stands for. Timezone-aware, one per tenor.
+
+    Carried rather than derived, because deriving it is exactly what ADR-002 forbids
+    downstream. ``ts_snapshot + tenor * 365 days`` is a daycount assumption wearing the clothes
+    of arithmetic: under ACT/365F it is right, under a 252-business-day count it is off by
+    days, and the consumer that made the guess would have no way to know which market it was
+    holding.
+
+    It is what lets a consumer holding a real position -- an option with a contractual expiry
+    on a calendar -- find the row of this grid that describes it. Without it the tenor axis is
+    a set of year fractions matching nothing anybody owns.
+    """
+
+    forwards: tuple[float, ...]
+    """Forward price at each tenor node, in the currency the strikes are quoted in. Positive,
+    finite, one per tenor.
+
+    The other half of the same problem, and the axis below is meaningless without it: the
+    moneyness axis is measured *against* these forwards, so a consumer that knows only ``k``
+    cannot say which strike any node refers to, and one holding a strike cannot say where on
+    the axis it falls. Publishing the axis without the number that defines it would be
+    publishing a coordinate system with no origin.
+
+    The same rule as ``SliceData.forward`` one contract over, for the same reason (ADR-002):
+    convention-dependent quantities are resolved before the boundary and travel with the data.
+    Recovering it downstream would mean pairing a smile with a forward that has since moved.
+    """
+
     vols: tuple[tuple[float, ...], ...]
     """Implied vols in absolute terms (``0.65`` is 65%), indexed ``vols[tenor][moneyness]``.
 
@@ -115,6 +144,28 @@ class VolGrid:
             raise ValueError("The moneyness axis must be a strictly increasing sequence")
         if not all(a < b for a, b in pairwise(self.tenors)):
             raise ValueError("The tenor axis must be a strictly increasing sequence")
+        if tenors_n != len(self.expiries):
+            raise ValueError(
+                "There should be one expiry per tenor, got "
+                f"{len(self.expiries)} expiries for {tenors_n} tenors"
+            )
+        if tenors_n != len(self.forwards):
+            raise ValueError(
+                "There should be one forward per tenor, got "
+                f"{len(self.forwards)} forwards for {tenors_n} tenors"
+            )
+        for i, expiry in enumerate(self.expiries):
+            require_aware(expiry, f"expiry at tenor {self.tenors[i]}")
+        if not all(a < b for a, b in pairwise(self.expiries)):
+            raise ValueError("The expiries must be a strictly increasing sequence")
+        for i, forward in enumerate(self.forwards):
+            # Finiteness first and the bad cases joined with `or`: `float("nan") <= 0` is False,
+            # so a NaN forward walks through an ordering guard written the other way round.
+            if not math.isfinite(forward) or forward <= 0:
+                raise ValueError(
+                    f"The forward must be positive and finite, got {forward} at "
+                    f"tenor {self.tenors[i]}"
+                )
         if tenors_n != len(self.vols):
             raise ValueError(
                 "There should be one smile per tenor, got "
@@ -142,6 +193,8 @@ class VolGrid:
         return {
             "log_moneyness": list(self.log_moneyness),
             "tenors": list(self.tenors),
+            "expiries": [expiry.isoformat() for expiry in self.expiries],
+            "forwards": list(self.forwards),
             "vols": [list(smile) for smile in self.vols],
         }
 
@@ -150,6 +203,8 @@ class VolGrid:
         return cls(
             log_moneyness=tuple(raw["log_moneyness"]),
             tenors=tuple(raw["tenors"]),
+            expiries=tuple(datetime.fromisoformat(one) for one in raw["expiries"]),
+            forwards=tuple(raw["forwards"]),
             vols=tuple(tuple(smile) for smile in raw["vols"]),
         )
 

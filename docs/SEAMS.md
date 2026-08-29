@@ -9,10 +9,6 @@ close naturally in a later phase.
 
 ## Market Data
 
-- **`max_quiet_seconds` does not cover a dead feed.** `IngestStreamUseCase` evaluates the snapshot
-  policy only when an update *arrives*, so the heartbeat covers a market that is quoting but not
-  moving, and not one whose feed has stopped. Closing it needs a timer racing the stream, which is
-  the two-task structure of F1-07.
 - **`ChainSnapshot.ts_exchange` is not clamped to `ts_local`**, so a venue clock running ahead would
   make `CalibratedSurface` reject `ts_calibrated < ts_snapshot`. The ACL reconciles them
   (ADR-021); the domain type still permits the state.
@@ -48,8 +44,10 @@ close naturally in a later phase.
 ## Risk
 
 - **`Position.underlying` is never cross-checked against the surface**, because `CalibratedSurface`
-  publishes a `market_id` and no underlying. Pairing a book with the right market is the use case's
-  job.
+  publishes a `market_id` and no underlying. Pairing a book with the right market is the caller's
+  job, and since F1-07 the caller is `entrypoints.pipeline._book_for`, which splits the configured
+  book by underlying and gives each market only its own share. Nothing structural stops a future
+  caller from handing over the whole book again.
 - **`FreshnessPolicy.evaluate` takes two bare instants**, so nothing structurally stops a caller
   passing `ts_calibrated`. The ADR-006 argument that it must be `ts_snapshot` is defended in the
   docstring only.
@@ -62,6 +60,20 @@ close naturally in a later phase.
 - **Risk's numerical greeks carry the grid's kinks** as well as the bump's truncation error. The
   at-the-money gamma of the test surface is about twice the analytic value — a fact Design §7.4
   wants visible, not a defect.
+
+## Entrypoints
+
+- **The adapter registry is empty.** `pipeline.default_adapters()` returns no provider, no
+  calibrator and no writer, so `volengine run` composes the whole graph and then refuses at
+  start-up with the name it could not find. F1-08's three walking-skeleton adapters are the three
+  lines that close it.
+- **Neural Surface is not wired into the pipeline.** `build_pipeline` runs Market Data to
+  Parametric Pricing to Risk; `TrainOnSnapshot` is built and tested but nothing constructs one,
+  and `AppConfig` has no section for the replay buffer, the arbitrage mesh, the gate thresholds,
+  the restart schedule or the seed it would need. Deliberate: its learner is torch, an optional
+  extra that arrives in F3-C, and five thresholds nothing in this build can exercise would be
+  five numbers chosen by guesswork. `--calibrators` therefore selects among parametric producers
+  only, which is why its help line does not repeat Design 8.1's `svi,neural` example.
 
 ## Cross-cutting
 

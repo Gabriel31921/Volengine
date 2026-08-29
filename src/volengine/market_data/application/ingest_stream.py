@@ -14,14 +14,15 @@ It does **not** publish them. An ``AsyncIterator[Event]`` hands them to the comp
 which owns the bus and the topic names -- so this module has no idea a bus exists, and a test
 drives it with a list.
 
-**The heartbeat has a seam, and it is here.** ``SnapshotPolicyConfig.max_quiet_seconds`` exists
-so that a calm market is still heard from, but this loop only evaluates the policy when an update
-arrives. A market that goes genuinely silent -- no ticks at all -- therefore emits nothing, which
-is precisely the failure the heartbeat was written to prevent. Closing it needs a timer racing
-the stream, which needs the ``sleep`` this context's ``Clock`` declares and the two-task
-structure that belongs to ``entrypoints/pipeline.py`` (F1-07). It is stated here rather than
-quietly left out: today the heartbeat covers a market that is quoting but not moving, which is
-the common case, and not one whose feed has stopped, which is the dangerous one.
+**The heartbeat is half here, and the other half is the composition root.**
+``SnapshotPolicyConfig.max_quiet_seconds`` exists so that a calm market is still heard from, but
+this loop evaluates the policy only when an update *arrives*: by itself it covers a market that is
+quoting and not moving, and not one whose feed has stopped -- the dangerous case, because silence
+downstream is indistinguishable from a dead process. What closes that is a timer racing this
+stream, and the timer lives in ``entrypoints/pipeline.py`` (``Pipeline._heartbeat``, F1-07): a
+second task calling the same :class:`BuildSnapshotUseCase` on the ``sleep`` this context's
+``Clock`` declares. The policy stays whole and undivided -- the timer supplies an occasion, never
+a verdict -- which is why nothing in this file had to learn that it exists.
 """
 
 from __future__ import annotations

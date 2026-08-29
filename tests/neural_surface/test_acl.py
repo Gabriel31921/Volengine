@@ -338,16 +338,19 @@ def test_the_worst_point_is_reported_beside_the_mean() -> None:
 
 
 def test_the_two_contexts_invert_a_price_to_the_same_volatility() -> None:
-    """**The guard on a deliberate duplication.**
+    """**The guard that the two contexts have not re-forked the formula.**
 
-    ``neural_surface/domain/pricing.py`` is a copy of ``parametric_pricing/domain/black76.py``,
-    because rule 6 forbids one context importing another. The risk is not that someone breaks one
-    of them -- it is that someone *improves* one of them, and the two producers then weight the
-    same market differently while every test in both contexts keeps passing. Design 6.5's whole
-    comparison rests on that not happening.
+    ``neural_surface/domain/pricing.py`` used to be a line-for-line copy of
+    ``parametric_pricing/domain/black76.py``, and this test was the only place the copies could be
+    required to agree, because ``tests/`` is subject to none of the import rules. Both are now thin
+    wrappers over ``shared_kernel/domain/black76.py``, so the agreement is structural and this
+    passes by construction.
 
-    ``tests/`` is subject to none of the import rules, which makes it the only place the two can
-    be required to agree.
+    It stays because the failure it guards against has not gone away, only moved: the risk was
+    never that someone breaks one implementation, it is that someone *improves* one of them, and
+    the two producers then weight the same market differently while every test in both contexts
+    keeps passing. Design 6.5's whole comparison rests on that not happening. Inlining the formula
+    back into one context -- the exact edit the old arrangement invited -- fails here.
     """
     from volengine.neural_surface.domain import pricing as neural
     from volengine.parametric_pricing.domain import black76 as parametric

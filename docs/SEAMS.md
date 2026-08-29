@@ -78,6 +78,15 @@ close naturally in a later phase.
   extra that arrives in F3-C, and five thresholds nothing in this build can exercise would be
   five numbers chosen by guesswork. `--calibrators` therefore selects among parametric producers
   only, which is why its help line does not repeat Design 8.1's `svi,neural` example.
+- **`examples/walking-skeleton.toml`'s position expiry is a fixed instant (2027-06-25) that will
+  rot.** TOML has no "N months from now" literal, while `ConstantProvider`'s three tenors are
+  relative to start-up, so the file can only pin an absolute date inside the window those tenors
+  currently cover. Past it, valuation refuses with `ExpiredInstrumentError` instead of interpolating
+  a value — a loud failure, not a silent one, but a maintenance date nothing enforces. The file's
+  own comment says so and the test guarding it deliberately asserts only that the config loads and
+  names registered adapters, never the date. Closing this for good means either a config field
+  expressed as an offset from start-up (which the composition root would resolve against
+  `SystemClock`) or accepting the periodic bump as the cost of a literal example file.
 
 ## Cross-cutting
 

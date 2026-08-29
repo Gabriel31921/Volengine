@@ -68,3 +68,99 @@ module = [
     "volengine.risk.domain.*",
 ]
 strict = true
+
+# ---------------------------------------------------------------- architecture
+
+# CLAUDE.md's import rules, as executable contracts (F1-09). `uv run lint-imports` runs from
+# scripts/verify.sh and from CI, and the contracts below are permanent: they exist to catch the
+# imports F2 and F3 introduce, which are invisible in review once the helper is three files away.
+#
+# Two limits of the tool, stated here so nobody reads their absence as permission:
+#
+#   * Rule 5 ("only */application/acl.py builds or consumes contracts DTOs") has no contract. It
+#     is about constructing DTOs, not about importing them, and the use cases legitimately import
+#     `contracts.events` for the events they return (ADR-016). It stays a review rule and is
+#     recorded in docs/SEAMS.md.
+#   * A `forbidden` contract is a deny list, not an allow list. Rules 1, 2, 3 and 7 name the
+#     libraries that must stay out; a brand-new third-party dependency in the domain is caught by
+#     review, not here.
+#
+# `forbidden` contracts follow indirect chains by default, which is the point of rule 3.
+
+[tool.importlinter]
+root_package = "volengine"
+include_external_packages = true
+
+[[tool.importlinter.contracts]]
+name = "The stack is layered: entrypoints on top, shared kernel at the bottom (rules 7, 8)"
+type = "layers"
+containers = ["volengine"]
+layers = [
+    "entrypoints",
+    "platform | market_data | parametric_pricing | neural_surface | risk",
+    "contracts",
+    "shared_kernel",
+]
+
+[[tool.importlinter.contracts]]
+name = "Inside a context: adapters > application > domain (rule 4)"
+type = "layers"
+containers = [
+    "volengine.market_data",
+    "volengine.parametric_pricing",
+    "volengine.neural_surface",
+    "volengine.risk",
+]
+layers = ["adapters", "application", "domain"]
+
+# Redundant with the sibling independence of the top-level layers contract, and kept on purpose:
+# rule 6 is load-bearing enough to be named in the configuration and reported under its own name.
+[[tool.importlinter.contracts]]
+name = "No context imports another context (rule 6)"
+type = "independence"
+modules = [
+    "volengine.market_data",
+    "volengine.parametric_pricing",
+    "volengine.neural_surface",
+    "volengine.risk",
+]
+
+[[tool.importlinter.contracts]]
+name = "The domain does not know the contracts (rule 3)"
+type = "forbidden"
+source_modules = [
+    "volengine.market_data.domain",
+    "volengine.parametric_pricing.domain",
+    "volengine.neural_surface.domain",
+    "volengine.risk.domain",
+]
+forbidden_modules = ["volengine.contracts"]
+
+[[tool.importlinter.contracts]]
+name = "The domain runs on stdlib, the shared kernel and numpy (rule 3)"
+type = "forbidden"
+source_modules = [
+    "volengine.market_data.domain",
+    "volengine.parametric_pricing.domain",
+    "volengine.neural_surface.domain",
+    "volengine.risk.domain",
+]
+forbidden_modules = ["asyncio", "scipy", "jax", "torch"]
+
+[[tool.importlinter.contracts]]
+name = "The contracts carry no array library (rule 2, ADR-011)"
+type = "forbidden"
+source_modules = ["volengine.contracts"]
+forbidden_modules = ["numpy", "scipy", "jax", "torch"]
+
+[[tool.importlinter.contracts]]
+name = "The shared kernel is stdlib only (rule 1, ADR-014)"
+type = "forbidden"
+source_modules = ["volengine.shared_kernel"]
+forbidden_modules = ["numpy", "scipy", "jax", "torch"]
+
+[[tool.importlinter.contracts]]
+name = "Platform carries contracts and stdlib (rule 7)"
+type = "forbidden"
+source_modules = ["volengine.platform"]
+forbidden_modules = ["numpy", "scipy", "jax", "torch"]

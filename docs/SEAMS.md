@@ -93,5 +93,13 @@ close naturally in a later phase.
 - **`_require_positive_finite` is written out in five domain modules.** The same argument as
   ADR-014 one level down, deliberately left for its own change. `require_aware` lived in six before
   it earned a name.
+- **Rule 5 of the import table has no mechanical guard.** import-linter sees imports, and "only
+  `*/application/acl.py` builds or consumes `contracts/` DTOs" is about construction: every use
+  case imports `contracts.events` legitimately, because ADR-016 has it return events. The other
+  seven rules became contracts in F1-09; this one stays a review rule, and the
+  `[tool.importlinter]` comment in `pyproject.toml` says so beside the seven that did not.
+- **The library bans are deny lists, not allow lists.** Rules 1, 2, 3 and 7 are `forbidden`
+  contracts naming `jax`, `torch`, `scipy` and `numpy`, so they catch the dependencies the design
+  argued about and would not notice a brand-new third-party import appearing in the domain.
 - **The vectorised JAX Black-76 of F3-A cannot live in the shared kernel** (rule 1, ADR-011). It is
   a genuine reimplementation and will be tested against the kernel as its oracle.

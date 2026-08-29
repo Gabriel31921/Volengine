@@ -54,6 +54,27 @@ class SurfaceEvaluationError(NeuralSurfaceError):
     """
 
 
+class NoImpliedVolError(NeuralSurfaceError):
+    """Raised when a quoted premium admits no implied volatility at all.
+
+    The price sits at or outside the open interval between the discounted intrinsic value and the
+    no-arbitrage ceiling, so no volatility reproduces it and there is nothing for the inversion to
+    find. Routine rather than exceptional: a mid taken from a crossed or stale book falls below
+    intrinsic regularly, and a deep in-the-money quote sits close enough to a bound that one tick
+    of noise crosses it.
+
+    The caller drops the quote from the batch; it does not repair it. That is why this is an
+    exception rather than a ``None`` return -- a quote that cannot be turned into a training point
+    has to be excluded by name, and folding it into an optional would put "no price" and "a price
+    of nothing" behind one check.
+
+    **A deliberate twin of ``parametric_pricing``'s error of the same name**, for the same reason
+    ``pricing.py`` in this package is a twin of its ``black76``: no context imports another
+    (rule 6), and one hierarchy per context is what makes ``except NeuralSurfaceError`` mean
+    "everything this context can fail with and nothing another can".
+    """
+
+
 class EmptyBufferError(NeuralSurfaceError):
     """Raised when a training batch is asked of a replay buffer that holds nothing.
 

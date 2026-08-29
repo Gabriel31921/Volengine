@@ -25,10 +25,10 @@ the engine be ignorant of the wiring.
 
 **Adapters arrive by name.** :func:`default_adapters` is the registry that maps a configured
 string -- ``provider = "constant"`` -- onto the callable that builds the object, and it is the
-only place in the engine allowed to import from a ``*/adapters/`` package. It is **empty today**:
-the walking skeleton's three adapters are F1-08's deliverable, so a configuration file naming one
-fails here with a message that says which name was not registered. Passing the registry into
-:func:`build_pipeline` rather than reaching for it keeps the graph testable with fakes.
+only place in the engine allowed to import from a ``*/adapters/`` package. It holds the walking
+skeleton's three adapters, and a configuration naming anything else -- ``svi-scipy``, which is
+F2's -- fails here with a message that says which name was not registered. Passing the registry
+into :func:`build_pipeline` rather than reaching for it keeps the graph testable with fakes.
 
 **Three of the four contexts are wired here, and Neural Surface is not.** The graph is Market
 Data to Parametric Pricing to Risk; ``TrainOnSnapshot`` has no place in it and ``AppConfig`` has
@@ -71,12 +71,14 @@ from volengine.entrypoints.config import (
     MarketConfig,
     RiskConfig,
 )
+from volengine.market_data.adapters.constant import ConstantProvider
 from volengine.market_data.application.acl import to_snapshot_ready
 from volengine.market_data.application.build_snapshot import BuildSnapshotUseCase
 from volengine.market_data.application.ingest_stream import IngestStreamUseCase
 from volengine.market_data.domain.ports import MarketDataProvider
 from volengine.market_data.domain.quote_chain import QuoteChain
 from volengine.market_data.domain.snapshot_policy import SnapshotPolicy
+from volengine.parametric_pricing.adapters.flat_vol import PRODUCER_ID, FlatVolCalibrator
 from volengine.parametric_pricing.application.calibrate_on_snapshot import CalibrateOnSnapshot
 from volengine.parametric_pricing.application.calibration_state import CalibrationState
 from volengine.parametric_pricing.domain.ports import Calibrator
@@ -85,6 +87,7 @@ from volengine.platform.clock import Clock
 from volengine.platform.executors import NamedExecutors
 from volengine.platform.metrics import MetricsSink
 from volengine.platform.runner import BusRunner, EventHandler
+from volengine.risk.adapters.console_report_writer import ConsoleReportWriter
 from volengine.risk.application.compute_report import ComputeReportUseCase
 from volengine.risk.application.surface_cache import LastValueSurfaceProvider
 from volengine.risk.domain.portfolio import Portfolio
@@ -131,15 +134,24 @@ class Adapters:
 
 
 def default_adapters() -> Adapters:
-    """Every concrete adapter this build knows how to make. **Empty until F1-08.**
+    """Every concrete adapter this build knows how to make: the walking skeleton's three.
 
-    The walking skeleton's ``ConstantProvider``, ``FlatVolCalibrator`` and
-    ``ConsoleReportWriter`` are F1-08's deliverable and this is where their three lines go. Until
-    then the engine composes, subscribes and routes exactly as it will afterwards, and refuses at
-    start-up with the name it could not find -- which is a better answer than a half-wired
-    pipeline that runs and never publishes. Recorded in ``docs/SEAMS.md``.
+    **The only function in the engine that imports from a ``*/adapters/`` package**, which is what
+    keeps every other module -- and every configuration file -- ignorant of infrastructure. A name
+    it does not hold is refused at start-up by :func:`_lookup`, so ``svi-scipy`` in a file today
+    says so on the first line of output rather than after a session that publishes nothing.
+
+    Each factory reads what its adapter needs out of the configuration section it is handed, and
+    nothing else: the provider takes the market's conventions, so the chain it invents is quoted
+    on the right underlying and expires at the venue's own hour, and the calibrator and the writer
+    take no configuration at all. There is deliberately no place for an adapter to be handed a
+    threshold that ADR-012 already put somewhere else.
     """
-    return Adapters(providers={}, calibrators={}, writers={})
+    return Adapters(
+        providers={"constant": lambda market: ConstantProvider(market.conventions)},
+        calibrators={PRODUCER_ID: lambda _calibration: FlatVolCalibrator()},
+        writers={"console": lambda _risk: ConsoleReportWriter()},
+    )
 
 
 # --- routing
@@ -420,7 +432,7 @@ def _require_every_position_is_quoted(config: AppConfig) -> None:
 def _lookup[F](registry: Mapping[str, F], name: str, kind: str) -> F:
     factory = registry.get(name)
     if factory is None:
-        known = ", ".join(sorted(registry)) or "nothing (F1-08 registers the first adapters)"
+        known = ", ".join(sorted(registry)) or "nothing"
         raise ConfigError(f"no {kind} adapter is registered under {name!r}; known: {known}")
     return factory
 

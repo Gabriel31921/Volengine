@@ -1,0 +1,97 @@
+# The walking skeleton, end to end:
+#
+#     uv run volengine report --config examples/walking-skeleton.toml --count 2
+#     uv run volengine run --config examples/walking-skeleton.toml --metrics
+#
+# `--count 2` rather than the default, and the reason is the snapshot policy doing its job: the
+# first snapshot of a session goes out the moment the first quote lands, so it holds one
+# instrument and one expiry, and a position beyond that single tenor is clamped back to it. The
+# second snapshot, one cadence later, rests on the whole chain. Publishing early and marking the
+# result degraded is deliberate -- silence is the one symptom nobody downstream can tell apart
+# from a dead process.
+#
+# Every threshold this engine draws a line at lives in a file like this one and never in the code
+# (ADR-012). This particular file names the three trivial adapters of F1-08 -- a constant feed, a
+# calibrator that averages instead of fitting, and a console writer -- so the numbers it produces
+# have no financial meaning whatsoever. What it demonstrates is that a quote crosses Market Data,
+# Parametric Pricing and Risk through the bus and comes out as a report.
+#
+# The keys are spelled exactly like the fields of the types they fill, because `entrypoints/
+# config.py` parses straight into the contexts' own threshold objects rather than into a mirror of
+# them (ADR-022). A value the domain refuses is refused here, with the table it came from named.
+
+[[market]]
+id = "BTC-DERIBIT"
+underlying = "BTC"
+provider = "constant"
+# How far the venue's clock may sit from ours before its stamps are disbelieved (ADR-021).
+max_skew_seconds = 30.0
+
+[market.conventions]
+day_count = "ACT/365F"
+expiry_time_utc = 08:00:00
+numeraire = "INVERSE"
+forward_method = "PROVIDER_UNDERLYING"
+
+[market.admissibility]
+max_spread_rel = 0.5
+max_age_seconds = 5.0
+moneyness_range = [-1.5, 1.5]
+max_iv_divergence_bp = 500.0
+convexity_tolerance = 0.0005
+min_size = 1.0
+
+[market.snapshot]
+cadence_seconds = 1.0
+# Zero, and only because the feed is constant: the quotes never move, so any positive threshold
+# would publish the first snapshot of the session and then nothing else for as long as it ran.
+# A real market wants a few tens of basis points here.
+material_move_threshold = 0.0
+min_coverage_ratio = 0.5
+# `max_quiet_seconds` is deliberately absent, which means "no heartbeat". The constant provider
+# ends its stream rather than going silent, and the timer exists for the feed that stops.
+
+[calibration]
+calibrators = ["flat-vol"]
+
+[calibration.grid]
+k_min = -0.4
+k_max = 0.4
+n_nodes = 17
+
+[calibration.weighting]
+spread_scale = 0.05
+flagged_factor = 0.25
+unpaired_itm_factor = 0.1
+
+[calibration.acceptance]
+# The RMSE a slice must beat to be published rather than republished stale (ADR-006). The constant
+# chain really is one volatility, so the flat fit lands within floating-point noise of it and is
+# accepted; against a market with a smile this same calibrator would be refused here, which is
+# exactly what the rule is for.
+max_rmse_vol_bp = 50.0
+
+[risk]
+writer = "console"
+
+[risk.freshness]
+warn_seconds = 30.0
+reject_seconds = 120.0
+
+[risk.report]
+discount = 1.0
+
+[risk.report.bumps]
+forward_rel = 0.01
+vol_abs = 0.01
+
+[[risk.position]]
+underlying = "BTC"
+# A fixed instant, because TOML has no way to say "ten months from now" -- so this date has to be
+# bumped once it passes, or the valuation refuses an expired position. It sits inside the tenors
+# the constant provider quotes (30, 90 and 365 days from start-up), so the volatility behind the
+# value below is interpolated rather than extrapolated past the end of the grid.
+expiry = 2027-06-25T08:00:00Z
+strike = 60000.0
+kind = "CALL"
+quantity = 1.0

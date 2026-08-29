@@ -413,11 +413,18 @@ def test_a_market_with_nothing_in_the_book_is_refused() -> None:
         build_from(make_app_config(markets=markets))
 
 
-def test_the_default_registry_is_empty_until_the_walking_skeleton() -> None:
-    """A structural test holding the seam open: F1-08 is what fills this."""
+def test_the_default_registry_holds_the_walking_skeleton_adapters() -> None:
+    """The three names a shipped configuration may use, and the seam F1-08 closed.
+
+    Names rather than objects: the factories are what ``build_pipeline`` calls, and asserting on
+    what they build here would only repeat the end-to-end test in ``test_walking_skeleton.py``.
+    What this pins is the vocabulary a TOML file is allowed to spell.
+    """
     adapters = default_adapters()
 
-    assert (adapters.providers, adapters.calibrators, adapters.writers) == ({}, {}, {})
+    assert set(adapters.providers) == {"constant"}
+    assert set(adapters.calibrators) == {"flat-vol"}
+    assert set(adapters.writers) == {"console"}
 
 
 async def test_a_report_goal_of_zero_is_a_caller_mistake() -> None:

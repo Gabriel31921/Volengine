@@ -63,10 +63,14 @@ close naturally in a later phase.
 
 ## Entrypoints
 
-- **The adapter registry is empty.** `pipeline.default_adapters()` returns no provider, no
-  calibrator and no writer, so `volengine run` composes the whole graph and then refuses at
-  start-up with the name it could not find. F1-08's three walking-skeleton adapters are the three
-  lines that close it.
+- **An adapter cannot be handed the engine's `Clock`.** `ProviderFactory` receives a
+  `MarketConfig` and nothing else (ADR-022), so `ConstantProvider` stamps its quotes off the wall
+  clock instead. Harmless here — a venue stamps its own messages and `max_skew_seconds`
+  reconciles them — and it stays harmless as long as the deterministic replay of ADR-004 arrives
+  as `RecordedProvider` in F3-B, replaying recorded instants rather than asking a synthetic feed
+  to read a different clock. A synthetic *generator* that must be reproducible (F2-03) is the case
+  that would reopen this: it needs either a fourth argument on the factories or a seed in its own
+  configuration section.
 - **Neural Surface is not wired into the pipeline.** `build_pipeline` runs Market Data to
   Parametric Pricing to Risk; `TrainOnSnapshot` is built and tested but nothing constructs one,
   and `AppConfig` has no section for the replay buffer, the arbitrage mesh, the gate thresholds,

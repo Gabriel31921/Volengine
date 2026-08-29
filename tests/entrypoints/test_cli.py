@@ -3,11 +3,12 @@
 Driven through typer's own runner, so what is asserted is what a person would see -- an exit code
 and a line on stderr -- rather than the return value of a function nobody calls that way.
 
-``run`` and ``report`` are not exercised to completion here, and cannot be until F1-08 registers
-an adapter: ``default_adapters()`` is empty, so every path through them stops at the registry.
-That is the seam, and the tests below pin the *message* it fails with, because "no provider
-adapter is registered under 'constant'" is the difference between a five-second fix and an
-afternoon. The graph those commands build is covered against fakes in ``test_pipeline.py``.
+``run`` and ``report`` are not exercised to completion here: the file every test below starts
+from names ``svi-scipy``, which is F2's calibrator and which no adapter is registered for, so
+those two paths stop at the registry. That is deliberate -- the tests pin the *message* it fails
+with, because "no calibrator adapter is registered under 'svi-scipy'" is the difference between a
+five-second fix and an afternoon. The graph those commands build is covered against fakes in
+``test_pipeline.py``, and the run that reaches a report in ``test_walking_skeleton.py``.
 """
 
 from __future__ import annotations
@@ -31,12 +32,14 @@ def invoke(*arguments: str) -> tuple[int, str]:
 # --- the two operative commands
 
 
-def test_run_stops_at_the_registry_until_the_walking_skeleton(tmp_path: Path) -> None:
-    """F1-07 composes the graph; F1-08 supplies the adapters it names. See docs/SEAMS.md.
+def test_run_stops_at_the_registry_when_the_file_names_an_unregistered_adapter(
+    tmp_path: Path,
+) -> None:
+    """A start-up failure by design: a name nobody registered is refused before anything runs.
 
     The assertion names the registry rather than one of its three mappings: which lookup fails
-    first is an ordering detail of ``build_pipeline``, and a test pinned to it would break the day
-    F1-08 registers a provider and leaves the writer for last.
+    first is an ordering detail of ``build_pipeline``, and a test pinned to it broke the day
+    F1-08 registered a provider and a writer but not this file's calibrator.
     """
     code, output = invoke("run", "--config", str(write_config(tmp_path)))
 

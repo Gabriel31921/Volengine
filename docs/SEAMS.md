@@ -45,8 +45,8 @@ close naturally in a later phase.
 
 - **`Position.underlying` is never cross-checked against the surface**, because `CalibratedSurface`
   publishes a `market_id` and no underlying. Pairing a book with the right market is the caller's
-  job, and since F1-07 the caller is `entrypoints.pipeline._book_for`, which splits the configured
-  book by underlying and gives each market only its own share. Nothing structural stops a future
+  job, and since F1-07 the caller is `entrypoints.pipeline._book_for` (ADR-022), which splits the
+  configured book by underlying and gives each market only its own share. Nothing structural stops a future
   caller from handing over the whole book again.
 - **`FreshnessPolicy.evaluate` takes two bare instants**, so nothing structurally stops a caller
   passing `ts_calibrated`. The ADR-006 argument that it must be `ts_snapshot` is defended in the

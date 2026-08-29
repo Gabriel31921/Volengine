@@ -30,14 +30,17 @@ in the current state.
 | [019](0019-the-two-producers-are-one-function-twice.md) | The two producers are one function twice | Accepted |
 | [020](0020-domain-api-departures-from-implementation-md.md) | Domain API departures from `Implementation.md` | Accepted |
 | [021](0021-acl-and-event-decisions-of-f1-06.md) | ACL and event decisions of F1-06 | Accepted |
+| [022](0022-composition-root-departures-of-f1-07.md) | Composition-root departures of F1-07 | Accepted |
 
 ADR-001 to ADR-010 are extracted from the design document. ADR-011 onward were taken during
 implementation and exist only here.
 
-ADR-020 and ADR-021 are the one departure from "one file, one decision": each collects the
-small API decisions of a build phase, which are individually too slight for a record of their own
-and collectively too load-bearing to lose. Every item in them is also stated in the docstring of
-the module that owns it.
+ADR-020, ADR-021 and ADR-022 are the one departure from "one file, one decision": each
+collects the small API decisions of a build phase — the domain layer, the ACLs and use cases, the
+composition root — which are individually too slight for a record of their own and collectively too
+load-bearing to lose. Every item in them is also stated in the docstring of the module that owns
+it. They are written once, when that phase is built, and never appended to afterwards: a later
+phase's departures get a later record, because these files are immutable like every other one.
 
 **Gaps left open on purpose are not ADRs.** They live in `docs/SEAMS.md`, because a record here is
 immutable and a seam is a condition that is still true until someone closes it.

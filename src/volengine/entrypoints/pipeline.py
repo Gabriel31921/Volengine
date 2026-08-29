@@ -256,7 +256,8 @@ def build_pipeline(
 
     Args:
         config: The whole configuration, already validated by ``load_config``.
-        adapters: The registry of concrete infrastructure. Passed in rather than taken from
+        adapters: The registry of concrete infrastructure, and a fifth argument
+            ``Implementation.md`` does not list (ADR-022). Passed in rather than taken from
             :func:`default_adapters` so that a test can run the entire graph on fakes -- which is
             what makes this module testable before F1-08 supplies any real adapter.
         clock: One clock for every context (ADR-004). ``SystemClock`` in production, ``ManualClock``
@@ -365,7 +366,8 @@ def build_pipeline(
 def _book_for(market: MarketConfig, portfolio: Portfolio) -> Portfolio:
     """The part of the book this market can value: the positions written on its underlying.
 
-    **The composition root's obligation, and it is written down as one.** ``position_risk`` never
+    **The composition root's obligation, and it is written down as one** (ADR-022).
+    ``position_risk`` never
     compares a position's underlying against the surface it is valued on, because a
     ``CalibratedSurface`` publishes a ``market_id`` and no underlying at all (``docs/SEAMS.md``);
     handing every market the whole book would therefore value BTC options off the ETH smile and

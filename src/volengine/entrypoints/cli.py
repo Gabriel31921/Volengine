@@ -49,9 +49,9 @@ MarketOption = Annotated[
 ]
 CalibratorsOption = Annotated[
     str | None,
-    # Design 8.1 spells the example `svi,neural`; the neural producer is not wired into the
-    # pipeline yet (docs/SEAMS.md), and a help line promising a name the engine cannot build is
-    # worse than one that names what the shipped configuration actually lists.
+    # The example was `svi,neural` in Design 8.1 until the neural producer turned out not to be
+    # wired into the pipeline (docs/SEAMS.md): a help line promising a name the engine cannot
+    # build is worse than one that names what the shipped configuration actually lists.
     typer.Option("--calibrators", help="Comma-separated producers to run, e.g. svi-scipy."),
 ]
 MetricsOption = Annotated[

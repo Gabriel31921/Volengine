@@ -12,7 +12,8 @@ already the types the use cases are built from. A parallel set of ``…Config`` 
 would be a second declaration of the same numbers with a second copy of the same guards, free to
 drift from the first -- so what this module adds is a *reader*, and the objects it hands back are
 the ones the contexts own. That is why the TOML keys are spelled exactly like the fields they
-fill: one vocabulary, no translation table to keep honest.
+fill: one vocabulary, no translation table to keep honest. ``Implementation.md`` lists the mirror
+types; ADR-022 records why they are not here.
 
 **Every failure is a ``ConfigError`` naming the table it came from.** A domain constructor raises
 ``ValueError("The reject_seconds must be above warn_seconds")``, which is the right message and
@@ -71,8 +72,8 @@ class MarketConfig:
     """Daycount, expiry time, numeraire and forward method (ADR-002).
 
     It carries ``market_id`` and ``underlying`` already, which is why neither is a field of its
-    own here even though ``Implementation.md`` lists them separately: two spellings of one
-    identifier can disagree, and the copy that lost would be the one every published event is
+    own here even though ``Implementation.md`` lists them separately (ADR-022): two spellings of
+    one identifier can disagree, and the copy that lost would be the one every published event is
     stamped with.
     """
 

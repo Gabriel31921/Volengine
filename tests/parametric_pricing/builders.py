@@ -12,14 +12,28 @@ collection magic rather than by an import anyone can follow. See ``tests/support
 
 from __future__ import annotations
 
+import math
+from collections.abc import Mapping
 from datetime import UTC, datetime
 
+from volengine.contracts.market_snapshot import (
+    MarketSnapshot,
+    OptionKind,
+    QualityBlock,
+    QuoteData,
+    QuoteFlag,
+    SliceData,
+)
+from volengine.parametric_pricing.application.acl import Weighting
+from volengine.parametric_pricing.application.grid_spec import GridSpec
+from volengine.parametric_pricing.domain.black76 import OptionKindP, price
 from volengine.parametric_pricing.domain.calibration import (
     CalibrationResult,
     CalibrationTask,
     SliceResult,
     SliceTask,
 )
+from volengine.parametric_pricing.domain.errors import CalibrationError
 from volengine.parametric_pricing.domain.svi_slice import (
     FreeParams,
     SVIParams,
@@ -200,3 +214,181 @@ def make_calibration_result(
             make_slice_result(expiry=FAR, tenor_years=FAR_TENOR),
         )
     return CalibrationResult(slices=slices, n_iterations=n_iterations, duration_ms=duration_ms)
+
+
+SNAPSHOT_MONEYNESS = (-0.30, -0.15, 0.0, 0.15, 0.30)
+"""Five strikes spanning the quoted band, symmetric about the forward.
+
+Symmetric on purpose: the at-the-money strike sits exactly on the forward, which is the boundary
+case the out-of-the-money rule has to have an answer for, and it is in the middle rather than at
+an end so a rule that got the comparison backwards fails visibly on both wings.
+"""
+
+
+def synthetic_quotes(
+    tenor_years: float,
+    forward: float = FORWARD,
+    params: SVIParams | None = None,
+    log_moneyness: tuple[float, ...] = SNAPSHOT_MONEYNESS,
+    both_sides: bool = True,
+    spread_rel: float = 0.02,
+    flags: tuple[QuoteFlag, ...] = (),
+) -> tuple[QuoteData, ...]:
+    """Quotes priced from a known SVI slice, so an inversion has a right answer to recover.
+
+    This is D-7's synthetic chain: prices are generated *forwards* through Black-76 from
+    parameters the test holds, so a test can assert that the ACL's inversion returns those exact
+    volatilities. A builder that invented plausible premiums instead would let an inversion that
+    was quietly wrong by a vol point pass every test in the suite.
+
+    ``both_sides`` puts a call and a put at every strike, which is what a liquid chain looks like
+    and what lets the out-of-the-money rule actually choose. Turning it off leaves only the leg
+    that is *in* the money on each side of the forward, which is the case the unpaired
+    down-weighting exists for.
+    """
+    fitted = make_params() if params is None else params
+    quotes: list[QuoteData] = []
+    for k in log_moneyness:
+        strike = forward * math.exp(k)
+        vol = fitted.implied_vol(k, tenor_years)
+        kinds = (
+            (OptionKind.CALL, OptionKind.PUT)
+            if both_sides
+            else ((OptionKind.PUT,) if k >= 0 else (OptionKind.CALL,))
+        )
+        for kind in kinds:
+            side = OptionKindP.CALL if kind is OptionKind.CALL else OptionKindP.PUT
+            quotes.append(
+                QuoteData(
+                    strike=strike,
+                    kind=kind,
+                    mid=price(forward, strike, tenor_years, vol, side),
+                    spread_rel=spread_rel,
+                    age_seconds=0.4,
+                    flags=flags,
+                    exchange_iv=vol,
+                )
+            )
+    return tuple(quotes)
+
+
+def make_market_snapshot(
+    snapshot_id: str = "BTC-DERIBIT:00000000",
+    market_id: str = "BTC-DERIBIT",
+    ts_exchange: datetime = NOW,
+    forward: float = FORWARD,
+    params: SVIParams | None = None,
+    log_moneyness: tuple[float, ...] = SNAPSHOT_MONEYNESS,
+    both_sides: bool = True,
+    spread_rel: float = 0.02,
+    flags: tuple[QuoteFlag, ...] = (),
+    degraded: bool = False,
+    tenors: tuple[tuple[datetime, float], ...] = ((NEAR, NEAR_TENOR), (FAR, FAR_TENOR)),
+) -> MarketSnapshot:
+    """A published snapshot whose premiums come from a known surface.
+
+    Two expiries, because one is the smallest number where a term structure exists and a slice
+    can be dropped without emptying the snapshot.
+    """
+    return MarketSnapshot(
+        snapshot_id=snapshot_id,
+        market_id=market_id,
+        ts_exchange=ts_exchange,
+        ts_local=ts_exchange,
+        underlying="BTC",
+        slices=tuple(
+            SliceData(
+                expiry=expiry,
+                tenor_years=tenor_years,
+                forward=forward,
+                quotes=synthetic_quotes(
+                    tenor_years=tenor_years,
+                    forward=forward,
+                    params=params,
+                    log_moneyness=log_moneyness,
+                    both_sides=both_sides,
+                    spread_rel=spread_rel,
+                    flags=flags,
+                ),
+                flags=(),
+            )
+            for expiry, tenor_years in tenors
+        ),
+        quality=QualityBlock(
+            coverage_ratio=1.0,
+            max_age_seconds=0.4,
+            n_quotes_admissible=0 if degraded else 20,
+            n_quotes_total=20,
+            forward_crosscheck_error=0.0,
+            degraded=degraded,
+        ),
+    )
+
+
+def make_weighting(
+    spread_scale: float = 0.05,
+    flagged_factor: float = 0.25,
+    unpaired_itm_factor: float = 0.10,
+) -> Weighting:
+    """Discounts that are visible without being extreme, so a test can tell them apart."""
+    return Weighting(
+        spread_scale=spread_scale,
+        flagged_factor=flagged_factor,
+        unpaired_itm_factor=unpaired_itm_factor,
+    )
+
+
+def make_grid_spec(k_min: float = -0.4, k_max: float = 0.4, n_nodes: int = 9) -> GridSpec:
+    """A mesh wider than the quoted band, so the published wings are extrapolation."""
+    return GridSpec(k_min=k_min, k_max=k_max, n_nodes=n_nodes)
+
+
+class StubCalibrator:
+    """A ``Calibrator`` that answers with whatever the test put in it.
+
+    Satisfies the port structurally, with no optimiser anywhere. It records the ``previous`` it
+    was handed, which is the only way to assert that the warm start is actually chained: a
+    learner or calibrator that accepted a history and ignored it would pass every other test.
+    """
+
+    def __init__(
+        self,
+        result: CalibrationResult | None = None,
+        producer_id: str = "svi-stub",
+        failure: CalibrationError | None = None,
+    ) -> None:
+        self._result = result
+        self._producer_id = producer_id
+        self._failure = failure
+        self.calls: list[Mapping[datetime, SVIParams] | None] = []
+
+    @property
+    def producer_id(self) -> str:
+        return self._producer_id
+
+    def answer_with(self, result: CalibrationResult) -> None:
+        """Change what the next call returns, so one test can drive two consecutive cycles.
+
+        The stale republish of ADR-006 is a statement about *sequence* -- a good cycle, then a bad
+        one -- so a test of it needs the same use case to be handed two different answers.
+        """
+        self._result = result
+
+    def calibrate(
+        self,
+        previous: Mapping[datetime, SVIParams] | None,
+        task: CalibrationTask,
+    ) -> CalibrationResult:
+        self.calls.append(previous)
+        if self._failure is not None:
+            raise self._failure
+        if self._result is not None:
+            return self._result
+        return CalibrationResult(
+            slices=tuple(
+                make_slice_result(expiry=one.expiry, tenor_years=one.tenor_years)
+                for one in task.slices
+            ),
+            n_iterations=3,
+            duration_ms=1.0,
+        )

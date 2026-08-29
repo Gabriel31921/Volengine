@@ -12,6 +12,7 @@ collection magic rather than by an import anyone can follow. See ``tests/support
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator, Sequence
 from datetime import UTC, datetime, time, timedelta
 
 from volengine.market_data.domain.admissibility import AdmissibilityThresholds
@@ -28,6 +29,7 @@ from volengine.market_data.domain.option_quote import (
     QuoteUpdate,
 )
 from volengine.market_data.domain.quote_chain import QuoteChain
+from volengine.market_data.domain.snapshot_policy import SnapshotPolicy, SnapshotPolicyConfig
 
 NOW = datetime(2026, 7, 27, 8, 0, tzinfo=UTC)
 NAIVE = datetime(2026, 7, 27, 8, 0)
@@ -117,3 +119,60 @@ def make_update(
         observation=make_observation(bid, ask, bid_size, ask_size, ts_exchange),
         underlying_price=underlying_price,
     )
+
+
+def make_snapshot_policy(
+    cadence_seconds: float = 1.0,
+    material_move_threshold: float = 0.0,
+    min_coverage_ratio: float = 0.0,
+    max_quiet_seconds: float | None = None,
+) -> SnapshotPolicy:
+    """A policy that emits on every cadence tick and never marks anything degraded.
+
+    The permissive defaults are what make the application tests readable: a test about the
+    snapshot *sequence* should not have to reason about whether a movement filter let the second
+    snapshot through. Each knob is turned by exactly the test that is about it.
+    """
+    return SnapshotPolicy(
+        SnapshotPolicyConfig(
+            cadence_seconds=cadence_seconds,
+            material_move_threshold=material_move_threshold,
+            min_coverage_ratio=min_coverage_ratio,
+            max_quiet_seconds=max_quiet_seconds,
+        )
+    )
+
+
+class StubProvider:
+    """A ``MarketDataProvider`` that replays a fixed script and then ends.
+
+    Satisfies the port structurally, with no venue, no socket and no asyncio primitive beyond the
+    generator itself. ``stream`` is written as ``async def`` returning an ``AsyncIterator`` via
+    ``yield``, which is exactly the shape the port's docstring says the annotation was chosen to
+    permit.
+
+    ``closed`` is recorded because the use case promises to close the provider however its loop
+    ends, and a promise about a ``finally`` block is only worth what a test asserting on it is.
+    """
+
+    def __init__(
+        self,
+        updates: Sequence[QuoteUpdate],
+        instruments: Sequence[InstrumentId] = (),
+    ) -> None:
+        self._updates = tuple(updates)
+        self._instruments = tuple(instruments)
+        self.closed = False
+
+    async def discover(self) -> tuple[InstrumentId, ...]:
+        return self._instruments
+
+    def stream(self) -> AsyncIterator[QuoteUpdate]:
+        return self._stream()
+
+    async def _stream(self) -> AsyncIterator[QuoteUpdate]:
+        for update in self._updates:
+            yield update
+
+    async def close(self) -> None:
+        self.closed = True

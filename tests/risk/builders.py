@@ -20,6 +20,12 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
+from volengine.contracts.calibrated_surface import (
+    CalibratedSurface,
+    FitMetrics,
+    SurfaceStatus,
+    VolGrid,
+)
 from volengine.risk.domain.freshness_policy import FreshnessDecision, FreshnessPolicy
 from volengine.risk.domain.portfolio import Portfolio, Position
 from volengine.risk.domain.pricing import OptionKindR
@@ -187,3 +193,69 @@ def make_report(
         positions=(make_position_risk(),) if positions is None else positions,
         message=message,
     )
+
+
+def vol_grid(
+    tenors: tuple[float, ...] = TENORS,
+    log_moneyness: tuple[float, ...] = K_AXIS,
+) -> tuple[tuple[float, ...], ...]:
+    """The same surface as :func:`total_variance_grid`, in the volatilities the contract carries."""
+    return tuple(tuple(smile_vol(tenor, k) for k in log_moneyness) for tenor in tenors)
+
+
+def make_calibrated_surface(
+    surface_id: str = "01JZQ0T4M2",
+    market_id: str = "BTC-DERIBIT",
+    producer_id: str = "svi-scipy",
+    ts_snapshot: datetime = NOW,
+    ts_calibrated: datetime | None = None,
+    status: SurfaceStatus = SurfaceStatus.OK,
+    tenors: tuple[float, ...] = TENORS,
+    expiries: tuple[datetime, ...] = EXPIRIES,
+    forwards: tuple[float, ...] = FORWARDS,
+    log_moneyness: tuple[float, ...] = K_AXIS,
+) -> CalibratedSurface:
+    """The published surface the ACL translates, on the same axes as :func:`make_view`.
+
+    Deliberately built from the same ``smile_vol`` the view builder uses, so a test can assert
+    that translating this one produces that one -- which is the whole content of the ACL.
+    """
+    return CalibratedSurface(
+        surface_id=surface_id,
+        source_snapshot_id="BTC-DERIBIT:00000000",
+        market_id=market_id,
+        ts_snapshot=ts_snapshot,
+        ts_calibrated=ts_snapshot if ts_calibrated is None else ts_calibrated,
+        producer_id=producer_id,
+        grid=VolGrid(
+            log_moneyness=log_moneyness,
+            tenors=tenors,
+            expiries=expiries,
+            forwards=forwards,
+            vols=vol_grid(tenors, log_moneyness),
+        ),
+        fit=FitMetrics(
+            rmse_vol_bp=12.0,
+            max_err_vol_bp=31.0,
+            n_quotes_used=40,
+            n_iterations=17,
+            duration_ms=8.4,
+        ),
+        status=status,
+        producer_meta=None,
+    )
+
+
+class StubSurfaceProvider:
+    """A ``SurfaceProvider`` holding whatever the test put in it, or nothing at all.
+
+    ``None`` is the interesting default: no surface is the ordinary state at start-up and one of
+    the two honest ways a report has nothing to say, so the empty provider is what a test of that
+    path needs and it should take no arguments to build.
+    """
+
+    def __init__(self, view: SurfaceView | None = None) -> None:
+        self._view = view
+
+    def latest(self, market_id: str) -> SurfaceView | None:
+        return self._view

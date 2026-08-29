@@ -26,7 +26,12 @@ from datetime import UTC, datetime, timedelta
 import numpy as np
 from numpy.typing import NDArray
 
+from volengine.neural_surface.application.acl import Weighting
+from volengine.neural_surface.application.grid_spec import GridSpec
+from volengine.neural_surface.application.train_on_snapshot import GateThresholds, TrainingSchedule
+from volengine.neural_surface.domain.errors import NeuralSurfaceError
 from volengine.neural_surface.domain.invariants import ArbitrageMesh, ArbitrageReport
+from volengine.neural_surface.domain.learned_surface import LearnedSurface
 from volengine.neural_surface.domain.replay_buffer import ReplayBuffer, StratificationSpec
 from volengine.neural_surface.domain.training_batch import TrainingBatch, TrainingSample
 
@@ -278,3 +283,73 @@ class CountingSurface:
         self.calls.append((len(tenors), len(k)))
         column = np.asarray(tenors, dtype=np.float64) * self.vol * self.vol
         return np.repeat(column[:, None], len(k), axis=1)
+
+
+def make_weighting(
+    spread_scale: float = 0.05,
+    flagged_factor: float = 0.25,
+    unpaired_itm_factor: float = 0.10,
+) -> Weighting:
+    """The same three numbers the parametric builder uses, and they have to stay the same.
+
+    Design 6.5 compares two producers fitted to one market; the weights are what that comparison
+    holds constant. A test suite that drifted them apart would be silently testing two different
+    experiments.
+    """
+    return Weighting(
+        spread_scale=spread_scale,
+        flagged_factor=flagged_factor,
+        unpaired_itm_factor=unpaired_itm_factor,
+    )
+
+
+def make_grid_spec(k_min: float = -0.4, k_max: float = 0.4, n_nodes: int = 9) -> GridSpec:
+    """A mesh wider than the quoted band, matching the parametric producer's node for node."""
+    return GridSpec(k_min=k_min, k_max=k_max, n_nodes=n_nodes)
+
+
+def make_schedule(
+    replay_size: int = 4,
+    restart_seconds: float | None = None,
+) -> TrainingSchedule:
+    """Replay on, restarts off. A restart is what a test asking about one switches on."""
+    return TrainingSchedule(replay_size=replay_size, restart_seconds=restart_seconds)
+
+
+def make_thresholds(butterfly: float = 1e-6, calendar: float = 1e-6) -> GateThresholds:
+    """Tight enough that a genuinely broken surface is refused, loose enough for rounding."""
+    return GateThresholds(butterfly=butterfly, calendar=calendar)
+
+
+class StubLearner:
+    """A ``SurfaceLearner`` that hands back whatever surface the test put in it.
+
+    Records the ``previous`` it was given on each call, which is the only way to assert that
+    fine-tuning is actually chained -- a learner that accepted a history and ignored it would turn
+    continuous training into a cold restart every snapshot with nothing raising.
+    """
+
+    def __init__(
+        self,
+        surface: LearnedSurface | None = None,
+        producer_id: str = "mlp-stub",
+        failure: NeuralSurfaceError | None = None,
+    ) -> None:
+        self._surface = surface if surface is not None else FlatVolSurface()
+        self._producer_id = producer_id
+        self._failure = failure
+        self.calls: list[tuple[LearnedSurface | None, TrainingBatch]] = []
+
+    @property
+    def producer_id(self) -> str:
+        return self._producer_id
+
+    def answer_with(self, surface: LearnedSurface) -> None:
+        """Change what the next call returns, so one test can drive two consecutive cycles."""
+        self._surface = surface
+
+    def update(self, previous: LearnedSurface | None, batch: TrainingBatch) -> LearnedSurface:
+        self.calls.append((previous, batch))
+        if self._failure is not None:
+            raise self._failure
+        return self._surface

@@ -179,7 +179,8 @@ def test_the_naive_erf_form_would_price_that_same_option_at_exactly_zero() -> No
     1.128e-19.
     """
     assert norm_cdf_via_erf(-9.0) == 0.0
-    assert 0.5 * math.erfc(9.0 / math.sqrt(2.0)) == pytest.approx(1.1285884e-19, rel=1e-6)
+    exact = 0.5 * math.erfc(9.0 / math.sqrt(2.0))
+    assert exact == pytest.approx(1.1285884e-19, rel=1e-6, abs=1e-24)
     assert call_price_via_erf(DEEP_WING_STRIKE, DEEP_WING_TENOR, DEEP_WING_VOL) == 0.0
 
 

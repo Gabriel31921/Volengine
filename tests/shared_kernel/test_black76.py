@@ -139,7 +139,7 @@ def test_the_normal_cdf_survives_the_left_tail() -> None:
     The naive form returns exactly ``0.0`` here. This is the trap that reappeared once per copy of
     this formula, which is the concrete reason the module exists at all.
     """
-    assert norm_cdf(-9.0) == pytest.approx(1.128588e-19, rel=1e-5)
+    assert norm_cdf(-9.0) == pytest.approx(1.128588e-19, rel=1e-5, abs=1e-24)
     assert norm_cdf(-20.0) > 0.0
 
 

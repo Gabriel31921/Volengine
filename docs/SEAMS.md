@@ -20,7 +20,15 @@ close naturally in a later phase.
 
 - **`SVIParams` admits `min_total_variance == 0` while `durrleman_g` refuses it.** `g` divides by
   `w`, and both `inf` and `nan` survive `max(0, -min(g))` as a clean zero, which would report a
-  collapsed slice as arbitrage-free. Revisit in F2-05 only if the soft penalty ever trips on it.
+  collapsed slice as arbitrage-free. The soft penalty of F2-05 does trip on it, at iterates the
+  optimiser walks through: `adapters/scipy_calibrator._residuals` answers the raise with a barrier
+  residual rather than letting one bad step kill a whole surface. The asymmetry itself stands.
+- **The scipy calibrator's tuning is not configuration yet.** `FitSettings` — Huber scale,
+  butterfly penalty, ridge, penalty mesh, pinning threshold, evaluation budget — arrives through
+  the constructor with defaults, and `entrypoints/config.py` has no section that feeds it. F2-07
+  owns the TOML; a section written here would have been thresholds no file reads, which is the
+  guesswork ADR-012 exists to prevent. The bounds behind `at_bound` are deliberately *not* part of
+  it (ADR-021).
 - **`test_durrleman.py` imports the private `_curve_and_derivatives`**, with no precedent in the
   repo. A sign slip in `w'` still yields a plausible `g`, so the derivative has to be pinned against
   an independent computation rather than only through the function that consumes it.

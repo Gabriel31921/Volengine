@@ -58,6 +58,13 @@ python_version = "3.13"
 files = ["src/volengine", "tests"]
 mypy_path = "src"
 
+# scipy ships no `py.typed` and no bundled stubs, so `scipy.optimize` is an untyped import.
+# Silenced here rather than at the import site: one entry that says which library is unchecked is
+# easier to audit than a `# type: ignore` per adapter, and F3-A's JAX calibrator will need its own.
+[[tool.mypy.overrides]]
+module = ["scipy.*"]
+ignore_missing_imports = true
+
 [[tool.mypy.overrides]]
 module = [
     "volengine.contracts.*",

@@ -55,6 +55,33 @@ min_coverage_ratio = 0.5
 calibrators = ["flat-vol"]
 
 [calibration.grid]
+# The published moneyness mesh (ADR-001): the surface travels as numbers on these nodes, and a
+# consumer interpolates between them with its own method. Narrower than the admissibility band
+# above on purpose -- `moneyness_range` is what may be *ingested*, this is what is *published*,
+# and the wings beyond it are extrapolation nobody quoted.
+#
+# Why seventeen nodes, as arithmetic rather than as taste. Linear interpolation of a smooth
+# function over a step `h` is wrong by at most `h^2 * max|w''| / 8`. For raw SVI the second
+# derivative of total variance is `b * sigma^2 / r^3` with `r >= sigma`, so it is largest at the
+# smile's own minimum and bounded there by `b / sigma`. With `h = (0.4 + 0.4) / 16 = 0.05` and a
+# plausible one-month crypto slice -- `b = 0.10`, `sigma = 0.20`, so `max|w''| = 0.5` -- the error
+# in total variance is at most `0.05^2 * 0.5 / 8 = 1.6e-4`. Converting at `dvol = dw / (2 * vol *
+# T)` with a 70% vol at one month gives **about 13 basis points of volatility**: a quarter of the
+# `max_rmse_vol_bp` a fit must beat to be published at all, and far under the couple of vol points
+# a crypto wing trades bid to ask. The interpolation is therefore invisible against the noise the
+# quotes already carry, which is what ADR-001 accepts when it says accuracy is lost between nodes.
+#
+# What that does *not* settle, and should not be read as settling. The bound scales as `b / sigma`:
+# a sharply kinked slice (`b = 0.35`, `sigma = 0.02`) is thirty-five times worse and seventeen
+# nodes would be nowhere near enough for it. So this is a statement about the shape *this* market
+# is expected to have, not a node count that travels -- which is exactly why the value lives in a
+# configuration file and why `application/grid_spec.py` declines to compute it in code. It also
+# bounds the interpolation only, never the fit error beside it, and it says nothing about the
+# tenor axis: the grid carries one node per fitted slice, and what Risk's bilinear interpolation
+# loses *between* two expiries is a separate limitation, recorded in `docs/SEAMS.md`.
+#
+# With the `flat-vol` calibrator this file names, `b = 0` and the interpolation error is exactly
+# zero. The number above is the bound that starts to matter the day `svi-scipy` is named here.
 k_min = -0.4
 k_max = 0.4
 n_nodes = 17

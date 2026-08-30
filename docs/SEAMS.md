@@ -23,12 +23,13 @@ close naturally in a later phase.
   collapsed slice as arbitrage-free. The soft penalty of F2-05 does trip on it, at iterates the
   optimiser walks through: `adapters/scipy_calibrator._residuals` answers the raise with a barrier
   residual rather than letting one bad step kill a whole surface. The asymmetry itself stands.
-- **The scipy calibrator's tuning is not configuration yet.** `FitSettings` — Huber scale,
-  butterfly penalty, ridge, penalty mesh, pinning threshold, evaluation budget — arrives through
-  the constructor with defaults, and `entrypoints/config.py` has no section that feeds it. F2-07
-  owns the TOML; a section written here would have been thresholds no file reads, which is the
-  guesswork ADR-012 exists to prevent. The bounds behind `at_bound` are deliberately *not* part of
-  it (ADR-021).
+- **The scipy calibrator's tuning is optional configuration.** `FitSettings` — Huber scale,
+  butterfly penalty, ridge, penalty mesh, pinning threshold, evaluation budget — is read from
+  `[calibration.fit]` since F2-07, but the section may be absent, and then the adapter's own
+  defaults apply. That is deliberate — a file running `flat-vol` alone must not have to state
+  seven numbers it never reads — and it does leave those defaults as constants in code for anyone
+  who does not write the section. The bounds behind `at_bound` are still *not* part of it
+  (ADR-021).
 - **`test_durrleman.py` imports the private `_curve_and_derivatives`**, with no precedent in the
   repo. A sign slip in `w'` still yields a plausible `g`, so the derivative has to be pinned against
   an independent computation rather than only through the function that consumes it.
@@ -65,11 +66,13 @@ close naturally in a later phase.
 - **Bilinear interpolation does not inherit no-arbitrage** between nodes. Past the last tenor a flat
   total variance means the implied vol decays as `1/sqrt(T)`: a two-year option off a one-year grid
   is priced at about 71% of the one-year vol.
-- **`CsvReportWriter` has no TOML home.** `RiskConfig.writer` names an adapter but carries no
-  output path, and `WriterFactory` receives the risk configuration and nothing else, so
-  `default_adapters()` registers `console` alone and the CSV writer is constructed by tests only.
-  F2-07 owns the wiring, on the same terms as `FitSettings` and `SyntheticConfig`: a path field
-  added before there is a factory to read it would be configuration nothing loads (ADR-012).
+- **`RiskConfig.output_path` is unvalidated until a writer opens it.** F2-07 gave the CSV writer
+  its TOML home — `writer = "csv"` with an `output_path` beside it, both refused at start-up if
+  the second is missing — but the path is read as written, and only the writer that uses one ever
+  looks at it. A `console` configuration carrying an `output_path` is accepted and ignored, which
+  is the opposite of how a `[market.synthetic]` beside another provider is treated. The asymmetry
+  is deliberate and thin: a path is not a block of thresholds, and refusing it would need
+  `config.py` to know which writers take one.
 - **Risk's numerical greeks carry the grid's kinks** as well as the bump's truncation error. The
   at-the-money gamma of the test surface is about twice the analytic value — a fact Design §7.4
   wants visible, not a defect.
@@ -81,9 +84,17 @@ close naturally in a later phase.
   clock instead. Harmless here — a venue stamps its own messages and `max_skew_seconds`
   reconciles them — and it stays harmless as long as the deterministic replay of ADR-004 arrives
   as `RecordedProvider` in F3-B, replaying recorded instants rather than asking a synthetic feed
-  to read a different clock. A synthetic *generator* that must be reproducible (F2-03) is the case
-  that would reopen this: it needs either a fourth argument on the factories or a seed in its own
-  configuration section.
+  to read a different clock. F2-07 took the second of the two answers this seam offered for the
+  synthetic feed: `[market.synthetic]` carries the seed *and* a `start`, so the stream is
+  reproducible from a file without any factory learning about the engine's clock. What is still
+  not reproducible from a file is a whole *run* under a `ManualClock` — the feed's timeline and
+  the engine's clock are two sources, and only the first one is in the TOML.
+- **A provider's settings are a named field, one per adapter.** `MarketConfig.synthetic` names the
+  one adapter it configures, and a second provider with settings gets a second field rather than a
+  shared untyped bag. That keeps every value validated where the error can name its table, and it
+  does mean the type grows by one optional field per configurable adapter — the alternative, a
+  `Mapping[str, Any]` handed to the factory, was refused because it moves parsing into
+  `*/adapters/` and takes the table name out of the message.
 - **Neural Surface is not wired into the pipeline.** `build_pipeline` runs Market Data to
   Parametric Pricing to Risk; `TrainOnSnapshot` is built and tested but nothing constructs one,
   and `AppConfig` has no section for the replay buffer, the arbitrage mesh, the gate thresholds,
@@ -91,13 +102,13 @@ close naturally in a later phase.
   extra that arrives in F3-C, and five thresholds nothing in this build can exercise would be
   five numbers chosen by guesswork. `--calibrators` therefore selects among parametric producers
   only, which is why its help line does not repeat Design 8.1's `svi,neural` example.
-- **`examples/walking-skeleton.toml`'s position expiry is a fixed instant (2027-06-25) that will
-  rot.** TOML has no "N months from now" literal, while `ConstantProvider`'s three tenors are
-  relative to start-up, so the file can only pin an absolute date inside the window those tenors
-  currently cover. Past it, valuation refuses with `ExpiredInstrumentError` instead of interpolating
-  a value — a loud failure, not a silent one, but a maintenance date nothing enforces. The file's
-  own comment says so and the test guarding it deliberately asserts only that the config loads and
-  names registered adapters, never the date. Closing this for good means either a config field
+- **The shipped examples' position expiries are fixed instants (2027-06-25) that will rot.** Both
+  `examples/walking-skeleton.toml` and `examples/synthetic-svi.toml` carry one. TOML has no "N
+  months from now" literal, while the feeds' tenors are relative to start-up, so a file can only
+  pin an absolute date inside the window those tenors currently cover. Past it, valuation refuses with `ExpiredInstrumentError` instead of interpolating
+  a value — a loud failure, not a silent one, but a maintenance date nothing enforces. Each file's
+  own comment says so and the tests guarding them deliberately assert only that the config loads
+  and names registered adapters, never the date. Closing this for good means either a config field
   expressed as an offset from start-up (which the composition root would resolve against
   `SystemClock`) or accepting the periodic bump as the cost of a literal example file.
 

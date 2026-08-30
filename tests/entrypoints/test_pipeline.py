@@ -13,6 +13,7 @@ rule is a report count, so every test below runs in milliseconds and always in t
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 
 import pytest
 
@@ -28,6 +29,7 @@ from tests.entrypoints.builders import (
     make_market_config,
     make_position,
     make_risk_config,
+    make_synthetic_settings,
     one_instrument,
     two_sided,
 )
@@ -41,7 +43,7 @@ from volengine.contracts.events import (
     SnapshotReady,
     SurfaceCalibrated,
 )
-from volengine.entrypoints.config import AppConfig, ConfigError
+from volengine.entrypoints.config import SYNTHETIC_PROVIDER, AppConfig, ConfigError
 from volengine.entrypoints.pipeline import (
     Adapters,
     Pipeline,
@@ -53,9 +55,12 @@ from volengine.entrypoints.pipeline import (
     surface_topic,
     topic_of,
 )
+from volengine.market_data.adapters.synthetic import SyntheticConfig, SyntheticProvider
+from volengine.parametric_pricing.adapters.scipy_calibrator import FitSettings, ScipyCalibrator
 from volengine.parametric_pricing.domain.errors import CalibrationError
 from volengine.platform.bus import InProcessConflatingBus
 from volengine.platform.clock import ManualClock
+from volengine.risk.adapters.csv_report_writer import CsvReportWriter
 from volengine.risk.domain.freshness_policy import FreshnessDecision
 
 
@@ -413,18 +418,19 @@ def test_a_market_with_nothing_in_the_book_is_refused() -> None:
         build_from(make_app_config(markets=markets))
 
 
-def test_the_default_registry_holds_the_walking_skeleton_adapters() -> None:
-    """The three names a shipped configuration may use, and the seam F1-08 closed.
+def test_the_default_registry_holds_every_adapter_this_build_can_make() -> None:
+    """The six names a shipped configuration may use: F1-08's three and F2's three beside them.
 
     Names rather than objects: the factories are what ``build_pipeline`` calls, and asserting on
-    what they build here would only repeat the end-to-end test in ``test_walking_skeleton.py``.
-    What this pins is the vocabulary a TOML file is allowed to spell.
+    what they build here would only repeat the end-to-end tests in ``test_walking_skeleton.py``
+    and ``test_synthetic_vertical.py``. What this pins is the vocabulary a TOML file is allowed
+    to spell -- exhaustively, so a name that disappears is as visible as one that arrives.
     """
     adapters = default_adapters()
 
-    assert set(adapters.providers) == {"constant"}
-    assert set(adapters.calibrators) == {"flat-vol"}
-    assert set(adapters.writers) == {"console"}
+    assert set(adapters.providers) == {"constant", "synthetic"}
+    assert set(adapters.calibrators) == {"flat-vol", "svi-scipy"}
+    assert set(adapters.writers) == {"console", "csv"}
 
 
 async def test_a_report_goal_of_zero_is_a_caller_mistake() -> None:
@@ -432,3 +438,125 @@ async def test_a_report_goal_of_zero_is_a_caller_mistake() -> None:
 
     with pytest.raises(ValueError, match="report goal must be positive"):
         await pipeline.run(max_reports=0)
+
+
+# --- the factories the registry holds
+
+
+def test_the_synthetic_feed_is_built_from_the_settings_the_file_carries() -> None:
+    """The provider really reads ``[market.synthetic]`` rather than falling back to its defaults.
+
+    The one assertion that would pass vacuously if the settings were dropped is the *count* of
+    instruments: two legs per strike per expiry, so a ladder of three strikes on one expiry is six
+    instruments and the adapter's own default -- eleven strikes on three expiries -- is sixty-six.
+    """
+    settings = make_synthetic_settings(strikes_per_expiry=3, expiry_days=(30.0,))
+    market = make_market_config(provider=SYNTHETIC_PROVIDER, synthetic=settings)
+
+    provider = default_adapters().providers[SYNTHETIC_PROVIDER](market)
+
+    assert isinstance(provider, SyntheticProvider)
+    assert provider.config == settings.config
+    assert provider.start == settings.start
+    assert len(provider.instruments) == 6
+
+
+def test_a_synthetic_feed_with_no_settings_falls_back_to_its_own_market() -> None:
+    """Absent is not empty: the adapter's defaults are a complete market, and it uses them."""
+    market = make_market_config(provider=SYNTHETIC_PROVIDER)
+
+    provider = default_adapters().providers[SYNTHETIC_PROVIDER](market)
+
+    assert isinstance(provider, SyntheticProvider)
+    assert provider.config == SyntheticConfig()
+
+
+def test_a_synthetic_session_that_would_outlive_its_own_expiry_names_the_market() -> None:
+    """An adapter's ``ValueError`` is an operator's ``ConfigError``, with the market on it.
+
+    A session of a hundred days against a thirty-day expiry is the configuration mistake that
+    actually happens, and the file is what has to change -- so it must not arrive as a traceback
+    out of ``market_data/adapters/``.
+    """
+    settings = make_synthetic_settings(expiry_days=(30.0,), cycles=100, interval_seconds=86_400.0)
+    market = make_market_config(provider=SYNTHETIC_PROVIDER, synthetic=settings)
+
+    with pytest.raises(ConfigError, match=r"market\[BTC-DERIBIT\].synthetic"):
+        default_adapters().providers[SYNTHETIC_PROVIDER](market)
+
+
+def test_the_scipy_calibrator_is_handed_the_tuning_the_file_states() -> None:
+    """``[calibration.fit]`` reaches the optimiser, rather than being parsed and dropped."""
+    settings = FitSettings(max_nfev=7)
+
+    calibrator = default_adapters().calibrators["svi-scipy"](
+        make_calibration_config(calibrators=("svi-scipy",), fit=settings)
+    )
+
+    assert isinstance(calibrator, ScipyCalibrator)
+    assert calibrator.settings == settings
+
+
+def test_a_calibrator_with_no_fit_table_keeps_the_settings_it_ships_with() -> None:
+    calibrator = default_adapters().calibrators["svi-scipy"](
+        make_calibration_config(calibrators=("svi-scipy",))
+    )
+
+    assert isinstance(calibrator, ScipyCalibrator)
+    assert calibrator.settings == FitSettings()
+
+
+def test_the_csv_writer_refuses_to_be_built_without_a_path() -> None:
+    """A writer with nowhere to write is refused at start-up, not at the first report."""
+    with pytest.raises(ConfigError, match="output_path"):
+        default_adapters().writers["csv"](make_risk_config(writer="csv"))
+
+
+def test_the_csv_writer_blames_the_file_for_a_directory_that_is_not_there(tmp_path: Path) -> None:
+    """An ``OSError`` from the adapter's own fail-fast constructor is a configuration error."""
+    absent = tmp_path / "no-such-directory" / "reports.csv"
+
+    with pytest.raises(ConfigError, match="cannot write reports"):
+        default_adapters().writers["csv"](make_risk_config(writer="csv", output_path=absent))
+
+
+def test_the_csv_writer_opens_the_file_the_risk_section_names(tmp_path: Path) -> None:
+    """The vacuous-pass guard on the two above: a usable path really does produce a writer."""
+    path = tmp_path / "reports.csv"
+
+    writer = default_adapters().writers["csv"](make_risk_config(writer="csv", output_path=path))
+
+    assert isinstance(writer, CsvReportWriter)
+    assert path.read_text(encoding="utf-8").startswith("ts_report,")
+
+
+# --- the duration stopping rule
+
+
+async def test_a_run_stops_when_its_duration_elapses() -> None:
+    """What ``volengine run --duration`` asks for: a bounded look at an unbounded feed.
+
+    ``BlockingProvider`` never ends its stream, so without the timer this call would not return.
+    Time is the ``ManualClock``'s, which advances on ``sleep`` instead of waiting -- the run is
+    therefore over in microseconds and the assertion is about the stopping rule, not about speed.
+    """
+    _, _, pipeline = make_pipeline(
+        BlockingProvider(updates=two_sided(), instruments=one_instrument())
+    )
+
+    await pipeline.run(duration_seconds=30.0)
+
+
+async def test_a_duration_of_zero_is_a_caller_mistake() -> None:
+    _, _, pipeline = make_pipeline(StubProvider(updates=()))
+
+    with pytest.raises(ValueError, match="duration must be positive"):
+        await pipeline.run(duration_seconds=0.0)
+
+
+async def test_a_duration_of_nan_is_refused_rather_than_slept_on() -> None:
+    """``nan <= 0`` is ``False``, so a guard written the obvious way would let this through."""
+    _, _, pipeline = make_pipeline(StubProvider(updates=()))
+
+    with pytest.raises(ValueError, match="duration must be positive"):
+        await pipeline.run(duration_seconds=float("nan"))

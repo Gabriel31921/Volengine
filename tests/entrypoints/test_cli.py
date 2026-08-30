@@ -4,17 +4,19 @@ Driven through typer's own runner, so what is asserted is what a person would se
 and a line on stderr -- rather than the return value of a function nobody calls that way.
 
 ``run`` and ``report`` are not exercised to completion here: the file every test below starts
-from names ``svi-scipy``, which is F2's calibrator and which no adapter is registered for, so
+from names ``svi-jax``, which is F3-A's calibrator and which no adapter is registered for, so
 those two paths stop at the registry. That is deliberate -- the tests pin the *message* it fails
-with, because "no calibrator adapter is registered under 'svi-scipy'" is the difference between a
+with, because "no calibrator adapter is registered under 'svi-jax'" is the difference between a
 five-second fix and an afternoon. The graph those commands build is covered against fakes in
-``test_pipeline.py``, and the run that reaches a report in ``test_walking_skeleton.py``.
+``test_pipeline.py``, the run that reaches a report in ``test_walking_skeleton.py``, and the one
+that reaches it through a fit in ``test_synthetic_vertical.py``.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
 from tests.entrypoints.builders import CONFIG_TOML, replacing, write_config
@@ -45,6 +47,32 @@ def test_run_stops_at_the_registry_when_the_file_names_an_unregistered_adapter(
 
     assert code == 2
     assert "adapter is registered under" in output
+
+
+def test_run_refuses_a_duration_of_zero(tmp_path: Path) -> None:
+    """Caught before the file is even read: "stop before starting" is a typo, not a session."""
+    code, output = invoke("run", "--config", str(write_config(tmp_path)), "--duration", "0")
+
+    assert code == 2
+    assert "--duration must be positive" in output
+
+
+@pytest.mark.parametrize("duration", ["nan", "inf"])
+def test_run_refuses_a_duration_that_is_not_a_number_of_seconds(
+    tmp_path: Path, duration: str
+) -> None:
+    """The NaN-ordering trap, at the boundary that owns flag validation.
+
+    ``nan <= 0`` is ``False``, so a guard written as an ordering test alone hands both of these to
+    ``Pipeline.run``, whose ``ValueError`` nothing in this module catches -- the operator gets a
+    traceback and exit 1 where the whole point of this layer is a message and exit 2. ``inf`` is
+    the same hole seen from the other side: it passes the ordering test outright and would sleep
+    for the rest of the session.
+    """
+    code, output = invoke("run", "--config", str(write_config(tmp_path)), "--duration", duration)
+
+    assert code == 2
+    assert "--duration must be positive and finite" in output
 
 
 def test_report_refuses_a_count_of_zero(tmp_path: Path) -> None:
@@ -94,7 +122,7 @@ def test_an_unknown_calibrator_lists_the_ones_configured(tmp_path: Path) -> None
     )
 
     assert code == 2
-    assert "svi-scipy" in output
+    assert "svi-jax" in output
 
 
 def test_an_empty_calibrator_flag_is_refused(tmp_path: Path) -> None:

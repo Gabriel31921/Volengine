@@ -1,0 +1,185 @@
+# The F2 vertical, end to end, on a market whose right answer is written down:
+#
+#     uv run volengine report --config examples/synthetic-svi.toml --count 2
+#     uv run volengine run --config examples/synthetic-svi.toml --duration 10 --metrics
+#
+# The difference from `walking-skeleton.toml` is that every number below means something. That
+# file names the three trivial adapters of F1-08 -- a constant feed, a calibrator that averages
+# instead of fitting, and a console -- and demonstrates only that a quote crosses three contexts.
+# This one names F2's: a feed that prices a known SVI surface with Black-76 and then spoils it on
+# purpose, and a calibrator that fits raw SVI back out of it with `scipy.least_squares`. So the
+# volatility that comes out of the report is a *recovered* one, and the parameters it was
+# generated from are in `[[market.synthetic.slice]]` for anyone who wants to check the recovery.
+#
+# Every threshold this engine draws a line at lives in a file like this one and never in the code
+# (ADR-012), and the keys are spelled exactly like the fields of the types they fill, because
+# `entrypoints/config.py` parses straight into the contexts' own objects rather than into a mirror
+# of them (ADR-022). A value the domain refuses is refused here, with the table it came from named.
+
+[[market]]
+id = "BTC-SYNTH"
+underlying = "BTC"
+provider = "synthetic"
+# How far the venue's clock may sit from ours before its stamps are disbelieved (ADR-021). The
+# synthetic feed stamps `ts_exchange` about 8 ms before `ts_local`, so nothing here trips it --
+# the knob is exercised, not tested, by this file.
+max_skew_seconds = 30.0
+
+[market.conventions]
+day_count = "ACT/365F"
+expiry_time_utc = 08:00:00
+numeraire = "INVERSE"
+forward_method = "PROVIDER_UNDERLYING"
+
+[market.admissibility]
+# The quote-quality rules of Design 4.3, and the synthetic feed exists to make them fire: two per
+# cent of its quotes come out crossed, absurdly wide, one-sided, sizeless or an hour old. Ingestion
+# *flags*; the calibrator weights or excludes. Nothing here deletes a quote for being unfittable.
+max_spread_rel = 0.5
+max_age_seconds = 5.0
+moneyness_range = [-1.5, 1.5]
+max_iv_divergence_bp = 500.0
+convexity_tolerance = 0.0005
+min_size = 1.0
+
+[market.snapshot]
+cadence_seconds = 1.0
+# Twenty basis points, which is exactly the size of the forward's move between cycles: the filter
+# therefore has something real to have an opinion about instead of passing everything.
+material_move_threshold = 0.002
+# Two per cent of quotes are junk and about a fifth of those are one-sided, so a cycle covers
+# roughly ninety-nine per cent of the chain. Eighty is a floor that a genuinely broken cycle
+# breaches and a normal one does not.
+min_coverage_ratio = 0.8
+# The heartbeat: a market that goes quiet is still heard from once every cadence. This feed
+# publishes on a timer and never falls silent, so what the knob buys here is the demonstration.
+max_quiet_seconds = 5.0
+
+# --- the invented market, and the answer a fit is checked against
+#
+# Read by `SyntheticProvider` alone; a `[market.synthetic]` beside any other provider is refused
+# rather than ignored. Present, the table is complete -- there is no partial override, because a
+# loader that filled the gaps would be restating defaults the adapter already documents.
+
+[market.synthetic]
+forward0 = 60000.0
+strikes_per_expiry = 11
+# The strike ladder, as `ln(K / F)` against the *initial* forward and fixed for the run: a venue
+# lists absolute strikes and does not relist them when the underlying moves. Narrower than the
+# published grid below, so the wings a consumer prices against really are extrapolation.
+log_moneyness_range = [-0.25, 0.25]
+spread_bp = 200.0
+# Half a volatility point of noise on every quote. This is the number the recovery is stated
+# against, and the one a calibrator must never be tuned against.
+vol_noise_bp = 50.0
+size = 10.0
+junk_quote_rate = 0.02
+forward_move_rel = 0.002
+latency_seconds = 0.008
+jitter_seconds = 0.05
+# Finite, so `volengine run` over this file terminates on its own.
+cycles = 20
+interval_seconds = 1.0
+# The stream is a function of this seed and of `start`. `start` is deliberately absent, which
+# means "read the wall clock once": the expiries below are relative to it, so a pinned origin
+# would put this file's whole chain in the past within a day. Pin both to reproduce a session.
+seed = 20260827
+
+# One slice per expiry, in the order the chain is published. The five raw SVI parameters generate
+# `w(k) = a + b (rho (k - m) + sqrt((k - m)^2 + sigma^2))`, which is annualised by the tenor these
+# conventions imply and priced through Black-76. The three are ordered in total variance at every
+# moneyness, so the generated surface is free of calendar arbitrage as well as of butterfly
+# arbitrage -- a generator quietly producing an arbitrageable truth would make every acceptance
+# threshold downstream meaningless.
+[[market.synthetic.slice]]
+expiry_days = 30.0
+a = 0.020
+b = 0.050
+rho = -0.30
+m = 0.0
+sigma = 0.20
+
+[[market.synthetic.slice]]
+expiry_days = 90.0
+a = 0.055
+b = 0.090
+rho = -0.25
+m = 0.0
+sigma = 0.25
+
+[[market.synthetic.slice]]
+# A year, rather than the six months the adapter's own defaults stop at, so the position below
+# sits inside the grid rather than past the end of it -- see the note beside its expiry.
+expiry_days = 365.0
+a = 0.190
+b = 0.180
+rho = -0.15
+m = 0.0
+sigma = 0.35
+
+[calibration]
+calibrators = ["svi-scipy"]
+
+[calibration.grid]
+# The published moneyness mesh (ADR-001). Wider than the quoted ladder, because a consumer asks
+# for wings nobody quoted; the arithmetic behind a node count is worked through in
+# `walking-skeleton.toml`, and it applies here with force, since `b` is no longer zero.
+k_min = -0.4
+k_max = 0.4
+n_nodes = 17
+
+[calibration.weighting]
+# What a quote counts for in the loss (ADR-018): tighter is heavier, a flagged quote keeps a
+# quarter of its weight, and an unpaired in-the-money one a tenth. Flagging and weighting are two
+# different jobs, done by two different contexts, and this is the second one.
+spread_scale = 0.05
+flagged_factor = 0.25
+unpaired_itm_factor = 0.1
+
+[calibration.acceptance]
+# The RMSE a slice must beat to be published rather than republished stale (ADR-006). The quotes
+# carry 50 bp of volatility noise by construction, so a fit that has recovered the surface still
+# shows an RMSE of that order and no threshold below it could ever be met. This is a few times the
+# noise: loose enough that a good fit goes out, tight enough that a collapsed one does not.
+max_rmse_vol_bp = 200.0
+
+[calibration.fit]
+# The empirical half of the fit -- everything Design 5.3 leaves to tuning, and the reasoning for
+# each value is in the `FitSettings` docstring beside the field. The values below are the ones the
+# calibrator ships with; they are spelled out rather than left absent so that this file is the one
+# place to change them.
+huber_scale_bp = 100.0
+durrleman_penalty_bp = 10000.0
+durrleman_mesh_nodes = 51
+durrleman_mesh_margin = 0.5
+min_quotes_for_free_shape = 5
+ridge_bp = 5.0
+max_nfev = 500
+
+[risk]
+writer = "console"
+# `writer = "csv"` needs an `output_path` naming the file, and appends one row per valued
+# position to it. Uncomment both to get a file a spreadsheet or `pandas.read_csv` can read.
+# output_path = "reports.csv"
+
+[risk.freshness]
+warn_seconds = 30.0
+reject_seconds = 120.0
+
+[risk.report]
+discount = 1.0
+
+[risk.report.bumps]
+forward_rel = 0.01
+vol_abs = 0.01
+
+[[risk.position]]
+underlying = "BTC"
+# A fixed instant, because TOML has no way to say "ten months from now" -- so this date has to be
+# bumped once it passes, or the valuation refuses an expired position. It sits between the ninety-
+# day and the one-year slice above, so its volatility is interpolated along the tenor axis rather
+# than extrapolated past the end of the grid, and it stays that way until the date itself arrives.
+expiry = 2027-06-25T08:00:00Z
+strike = 60000.0
+kind = "CALL"
+quantity = 1.0

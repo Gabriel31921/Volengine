@@ -25,10 +25,18 @@ the engine be ignorant of the wiring.
 
 **Adapters arrive by name.** :func:`default_adapters` is the registry that maps a configured
 string -- ``provider = "constant"`` -- onto the callable that builds the object, and it is the
-only place in the engine allowed to import from a ``*/adapters/`` package. It holds the walking
-skeleton's three adapters, and a configuration naming anything else -- ``svi-scipy``, which is
-F2's -- fails here with a message that says which name was not registered. Passing the registry
-into :func:`build_pipeline` rather than reaching for it keeps the graph testable with fakes.
+only place in the engine that *constructs* one. It holds six: the walking skeleton's three and
+F2's three beside them, so a file may name a constant feed or a synthetic one, a mean or a fit, a
+console or a file. A name it does not hold fails here with a message that says which one was not
+registered. Passing the registry into :func:`build_pipeline` rather than reaching for it keeps the
+graph testable with fakes.
+
+``entrypoints/config.py`` also imports from two ``*/adapters/`` modules since F2-07 (ADR-028,
+superseding one sentence of ADR-022), for the types ``SyntheticConfig`` and ``FitSettings`` and
+nothing else: their fields are thresholds a
+deployment retunes (ADR-012) and mirroring them in the loader would be a second copy of their
+guards. So the claim above is about construction, not about imports -- what neither module allows
+is a *configuration file* naming a class.
 
 **Three of the four contexts are wired here, and Neural Surface is not.** The graph is Market
 Data to Parametric Pricing to Risk; ``TrainOnSnapshot`` has no place in it and ``AppConfig`` has
@@ -53,6 +61,7 @@ on the loop -- never from the worker -- because ``InProcessConflatingBus`` drive
 from __future__ import annotations
 
 import asyncio
+import math
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Executor
 from dataclasses import dataclass
@@ -65,6 +74,7 @@ from volengine.contracts.events import (
     SurfaceCalibrated,
 )
 from volengine.entrypoints.config import (
+    SYNTHETIC_PROVIDER,
     AppConfig,
     CalibrationConfig,
     ConfigError,
@@ -72,13 +82,17 @@ from volengine.entrypoints.config import (
     RiskConfig,
 )
 from volengine.market_data.adapters.constant import ConstantProvider
+from volengine.market_data.adapters.synthetic import SyntheticProvider
 from volengine.market_data.application.acl import to_snapshot_ready
 from volengine.market_data.application.build_snapshot import BuildSnapshotUseCase
 from volengine.market_data.application.ingest_stream import IngestStreamUseCase
 from volengine.market_data.domain.ports import MarketDataProvider
 from volengine.market_data.domain.quote_chain import QuoteChain
 from volengine.market_data.domain.snapshot_policy import SnapshotPolicy
-from volengine.parametric_pricing.adapters.flat_vol import PRODUCER_ID, FlatVolCalibrator
+from volengine.parametric_pricing.adapters.flat_vol import PRODUCER_ID as FLAT_VOL_ID
+from volengine.parametric_pricing.adapters.flat_vol import FlatVolCalibrator
+from volengine.parametric_pricing.adapters.scipy_calibrator import PRODUCER_ID as SCIPY_ID
+from volengine.parametric_pricing.adapters.scipy_calibrator import ScipyCalibrator
 from volengine.parametric_pricing.application.calibrate_on_snapshot import CalibrateOnSnapshot
 from volengine.parametric_pricing.application.calibration_state import CalibrationState
 from volengine.parametric_pricing.domain.ports import Calibrator
@@ -88,6 +102,7 @@ from volengine.platform.executors import NamedExecutors
 from volengine.platform.metrics import MetricsSink
 from volengine.platform.runner import BusRunner, EventHandler
 from volengine.risk.adapters.console_report_writer import ConsoleReportWriter
+from volengine.risk.adapters.csv_report_writer import CsvReportWriter
 from volengine.risk.application.compute_report import ComputeReportUseCase
 from volengine.risk.application.surface_cache import LastValueSurfaceProvider
 from volengine.risk.domain.portfolio import Portfolio
@@ -134,24 +149,77 @@ class Adapters:
 
 
 def default_adapters() -> Adapters:
-    """Every concrete adapter this build knows how to make: the walking skeleton's three.
+    """Every concrete adapter this build knows how to make: two feeds, two producers, two writers.
 
-    **The only function in the engine that imports from a ``*/adapters/`` package**, which is what
-    keeps every other module -- and every configuration file -- ignorant of infrastructure. A name
-    it does not hold is refused at start-up by :func:`_lookup`, so ``svi-scipy`` in a file today
-    says so on the first line of output rather than after a session that publishes nothing.
+    **The only function in the engine that constructs an adapter**, which is what keeps every
+    other module -- and every configuration file -- ignorant of infrastructure. A name it does not
+    hold is refused at start-up by :func:`_lookup`, so a typo says so on the first line of output
+    rather than after a session that publishes nothing.
 
     Each factory reads what its adapter needs out of the configuration section it is handed, and
-    nothing else: the provider takes the market's conventions, so the chain it invents is quoted
-    on the right underlying and expires at the venue's own hour, and the calibrator and the writer
-    take no configuration at all. There is deliberately no place for an adapter to be handed a
-    threshold that ADR-012 already put somewhere else.
+    nothing else: a provider takes the market it belongs to, a calibrator the calibration section,
+    a writer the risk section. There is deliberately no place for an adapter to be handed a
+    threshold that ADR-012 already put somewhere else, and no factory reaches past its own section
+    to find one.
+
+    Three of the six take no settings at all, and that is a property of those adapters rather than
+    an oversight: a constant feed, a weighted mean and a console have nothing a deployment could
+    retune. The other three read the sections F2-07 gave them.
     """
     return Adapters(
-        providers={"constant": lambda market: ConstantProvider(market.conventions)},
-        calibrators={PRODUCER_ID: lambda _calibration: FlatVolCalibrator()},
-        writers={"console": lambda _risk: ConsoleReportWriter()},
+        providers={
+            "constant": lambda market: ConstantProvider(market.conventions),
+            SYNTHETIC_PROVIDER: _synthetic_provider,
+        },
+        calibrators={
+            FLAT_VOL_ID: lambda _calibration: FlatVolCalibrator(),
+            # `fit` is `None` unless the file states a `[calibration.fit]` table, and the
+            # calibrator answers that with the settings it ships with -- which are argued for in
+            # its own docstring. Passing it through rather than substituting a default here keeps
+            # this module from holding an opinion about a number it does not own.
+            SCIPY_ID: lambda calibration: ScipyCalibrator(calibration.fit),
+        },
+        writers={
+            "console": lambda _risk: ConsoleReportWriter(),
+            "csv": _csv_report_writer,
+        },
     )
+
+
+def _synthetic_provider(market: MarketConfig) -> MarketDataProvider:
+    """The synthetic feed, on the market it belongs to and the settings the file gave it.
+
+    Named rather than a lambda because of the ``except``. ``SyntheticProvider`` refuses a
+    configuration it cannot generate a chain from -- a session that would outlive its own nearest
+    expiry is the one that actually happens -- with a plain ``ValueError``, which is right for the
+    adapter and wrong for an operator: it is a file that has to change, so it leaves here as a
+    ``ConfigError`` naming the market, like every other rejected number.
+    """
+    settings = market.synthetic
+    try:
+        if settings is None:
+            return SyntheticProvider(market.conventions)
+        return SyntheticProvider(market.conventions, settings.config, settings.start)
+    except ValueError as failure:
+        raise ConfigError(f"market[{market.market_id}].synthetic: {failure}") from failure
+
+
+def _csv_report_writer(risk: RiskConfig) -> ReportWriter:
+    """The file writer, on the path the risk section names.
+
+    Two failures belong to the file rather than to the adapter and are translated here. A missing
+    ``output_path`` is a writer with nowhere to write, refused at start-up rather than at the
+    first report; an ``OSError`` is a directory that does not exist or cannot be written to, which
+    ``CsvReportWriter`` provokes deliberately in its constructor so that it happens now and not
+    thirty seconds into a session whose quotes are already gone.
+    """
+    if risk.output_path is None:
+        raise ConfigError("risk: the 'csv' writer needs an 'output_path' naming the file to write")
+    try:
+        return CsvReportWriter(risk.output_path)
+    except OSError as failure:
+        message = f"risk: cannot write reports to {risk.output_path} ({failure})"
+        raise ConfigError(message) from failure
 
 
 # --- routing
@@ -496,10 +564,12 @@ class Pipeline:
         """How many reports reached the writer during the last run. Read-only, for the CLI."""
         return self._reports_written
 
-    async def run(self, max_reports: int | None = None) -> None:
-        """Run every task until ingestion ends, the report goal is met, or the caller cancels.
+    async def run(
+        self, max_reports: int | None = None, duration_seconds: float | None = None
+    ) -> None:
+        """Run every task until ingestion ends, a stopping rule fires, or the caller cancels.
 
-        Three ways a run finishes, and each of them is somebody's normal:
+        Four ways a run finishes, and each of them is somebody's normal:
 
         * **Every provider's stream ended.** A recorded replay and the walking skeleton's fixed
           chain are finite, and when the last one runs out there is nothing left to *start*. What
@@ -512,6 +582,10 @@ class Pipeline:
           once against a live surface and stop. Nothing is settled in that case, deliberately --
           the caller has what it asked for, and draining further work would only produce reports
           the stopping rule has already refused to write.
+        * **The session ran its time**, which is what ``volengine run --duration`` asks for: a
+          bounded observation of an unbounded feed. Nothing is settled there either -- the caller
+          asked to stop at a wall-clock instant, not to stop and then keep working -- so it ends
+          like the goal rather than like an exhausted stream.
         * **Cancellation**, which is how a long-running session is stopped from outside. Nothing
           is settled there either: an interrupt means stop now, and awaiting a calibration inside
           a cancelled ``finally`` is how a shutdown hangs.
@@ -521,10 +595,16 @@ class Pipeline:
                 ingestion ends. Counting *reports* rather than snapshots or surfaces is
                 deliberate: it is the only event at the end of the whole chain, so a run that
                 reaches it has exercised every hop.
+            duration_seconds: Stop after this long, or ``None`` for no time limit. Measured on the
+                injected ``Clock`` and not on ``asyncio.sleep``, like the heartbeat and for the
+                same reason (ADR-004): under a ``ManualClock`` a run bounded by time has to be
+                bounded by *simulated* time, or a replay would end when the machine felt like it.
+                The consequence is the heartbeat's: this task advances a manual clock on its own.
 
         Raises:
-            ValueError: If ``max_reports`` is not positive. Zero would mean "stop before
-                starting", which is a caller mistake dressed as a configuration.
+            ValueError: If ``max_reports`` is not positive, or ``duration_seconds`` is not
+                positive and finite. Zero would mean "stop before starting", which is a caller
+                mistake dressed as a configuration.
             Exception: Whatever a task raised. A provider that fails to connect, a chain fed
                 another market's quotes -- both are wiring or infrastructure failures that must
                 surface rather than be counted and survived. Handler exceptions never reach here:
@@ -532,6 +612,12 @@ class Pipeline:
         """
         if max_reports is not None and max_reports <= 0:
             raise ValueError(f"The report goal must be positive, got {max_reports}")
+        if duration_seconds is not None and (
+            not math.isfinite(duration_seconds) or duration_seconds <= 0
+        ):
+            raise ValueError(
+                f"The run duration must be positive and finite, got {duration_seconds}"
+            )
 
         self._max_reports = max_reports
         self._reports_written = 0
@@ -549,28 +635,33 @@ class Pipeline:
             if market.heartbeat_seconds is not None
         ]
         consumers = [asyncio.create_task(runner.run(), name="runner") for runner in self._runners]
-        goal = asyncio.create_task(self._wait_for_goal(), name="report-goal")
+        # The stopping rules, kept together: whichever of them completes, the run is over and
+        # nothing is drained. Everything else in the wait set finishing means either the feed ran
+        # out -- which does drain -- or a task failed, which must be re-raised.
+        stoppers = {asyncio.create_task(self._wait_for_goal(), name="report-goal")}
+        if duration_seconds is not None:
+            stoppers.add(asyncio.create_task(self._clock.sleep(duration_seconds), name="duration"))
 
         try:
             finished, _ = await asyncio.wait(
-                {goal, *sources, *consumers}, return_when=asyncio.FIRST_COMPLETED
+                {*stoppers, *sources, *consumers}, return_when=asyncio.FIRST_COMPLETED
             )
             for task in finished:
-                if task is not goal:
+                if task not in stoppers:
                     # Re-raises whatever ended it, and does nothing for a clean return. The
                     # consumers and the heartbeat never return on their own, so anything here
                     # other than ingestion finishing is a failure that must not be swallowed.
                     task.result()
-            if goal not in finished:
+            if not finished & stoppers:
                 await self._settle(sources)
         finally:
             # The order matters. Cancel and await the tasks first so a provider's `finally` gets
             # to close its connection while the loop is still running, and only then take the
             # thread pools down -- shutting them first would leave a cancelled handler awaiting a
             # future on a pool that is going away.
-            for task in (goal, *sources, *consumers):
+            for task in (*stoppers, *sources, *consumers):
                 task.cancel()
-            await asyncio.gather(goal, *sources, *consumers, return_exceptions=True)
+            await asyncio.gather(*stoppers, *sources, *consumers, return_exceptions=True)
             self._executors.shutdown()
 
     async def _settle(self, sources: Sequence[asyncio.Task[None]]) -> None:

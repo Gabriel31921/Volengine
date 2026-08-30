@@ -62,11 +62,19 @@ wired contexts. `volengine run` drives the same graph without a stopping rule; `
 `replay` refuse with exit 1 until F3-B.
 
 The adapters behind it are deliberately trivial — a constant chain, a flat-volatility calibrator,
-a console writer — because their job is to prove the graph, not the mathematics. A second feed,
-`SyntheticProvider`, generates a *known* SVI surface priced through Black-76 and then spoils it
-(spread, sizes, timestamp jitter, junk quotes keyed to the admissibility rules), which is what
-gives the calibrator a right answer to be measured against. Neural Surface is implemented but
-deliberately not wired yet; see `docs/SEAMS.md`.
+a console writer — because their job is to prove the graph, not the mathematics. The second shipped
+configuration runs the same graph on the adapters that do:
+
+```bash
+uv run volengine report --config examples/synthetic-svi.toml --count 2
+```
+
+`SyntheticProvider` generates a *known* SVI surface priced through Black-76 and then spoils it
+(spread, sizes, timestamp jitter, junk quotes keyed to the admissibility rules); `ScipyCalibrator`
+fits raw SVI back out of it with `least_squares`; and the report carries a volatility that can be
+checked against the parameters the file itself declares. `--duration <seconds>` bounds a `run`,
+and `writer = "csv"` with an `output_path` writes one row per valued position instead of printing.
+Neural Surface is implemented but deliberately not wired yet; see `docs/SEAMS.md`.
 
 ## Development
 

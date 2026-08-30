@@ -15,19 +15,21 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Mapping, Sequence
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from pathlib import Path
 from time import sleep as thread_sleep
 
-from tests.market_data.builders import FORWARD, NEAR, make_instrument, make_update
+from tests.market_data.builders import FORWARD, NEAR, NOW, make_instrument, make_update
 from tests.parametric_pricing.builders import StubCalibrator, make_grid_spec, make_weighting
 from volengine.entrypoints.config import (
     AppConfig,
     CalibrationConfig,
     MarketConfig,
     RiskConfig,
+    SyntheticSettings,
 )
 from volengine.entrypoints.pipeline import Adapters, CalibratorFactory
+from volengine.market_data.adapters.synthetic import SVIParamsSpec, SyntheticConfig
 from volengine.market_data.domain.admissibility import AdmissibilityThresholds
 from volengine.market_data.domain.market_conventions import (
     DayCount,
@@ -38,6 +40,7 @@ from volengine.market_data.domain.market_conventions import (
 from volengine.market_data.domain.option_quote import InstrumentId, OptionKindD, QuoteUpdate
 from volengine.market_data.domain.ports import MarketDataProvider
 from volengine.market_data.domain.snapshot_policy import SnapshotPolicyConfig
+from volengine.parametric_pricing.adapters.scipy_calibrator import FitSettings
 from volengine.parametric_pricing.application.calibrate_on_snapshot import Acceptance
 from volengine.parametric_pricing.domain.calibration import CalibrationResult, CalibrationTask
 from volengine.parametric_pricing.domain.ports import Calibrator
@@ -59,6 +62,34 @@ UNDERLYING = "BTC"
 splits one by the other, so a test about that split changes exactly one of them."""
 
 
+def make_synthetic_settings(
+    strikes_per_expiry: int = 3,
+    expiry_days: tuple[float, ...] = (30.0,),
+    cycles: int = 2,
+    interval_seconds: float = 0.0,
+    start: datetime | None = NOW,
+) -> SyntheticSettings:
+    """A tiny invented market: one expiry, a three-strike ladder, and a pinned origin.
+
+    Small on purpose. What the composition root has to get right is that these numbers *arrive*,
+    and the cheapest way to see that is a chain whose size differs from the adapter's own default.
+    ``start`` is pinned so nothing built from this builder reads the wall clock.
+    """
+    return SyntheticSettings(
+        config=SyntheticConfig(
+            expiries=tuple(timedelta(days=days) for days in expiry_days),
+            true_params={
+                timedelta(days=days): SVIParamsSpec(a=0.02, b=0.05, rho=-0.3, m=0.0, sigma=0.2)
+                for days in expiry_days
+            },
+            strikes_per_expiry=strikes_per_expiry,
+            cycles=cycles,
+            interval_seconds=interval_seconds,
+        ),
+        start=start,
+    )
+
+
 def make_market_config(
     market_id: str = MARKET_ID,
     provider: str = PROVIDER_NAME,
@@ -66,6 +97,7 @@ def make_market_config(
     material_move_threshold: float = 0.0,
     max_quiet_seconds: float | None = None,
     underlying: str = UNDERLYING,
+    synthetic: SyntheticSettings | None = None,
 ) -> MarketConfig:
     """One market whose policy publishes on every cadence tick and never marks anything degraded.
 
@@ -98,12 +130,14 @@ def make_market_config(
         ),
         provider=provider,
         max_skew_seconds=30.0,
+        synthetic=synthetic,
     )
 
 
 def make_calibration_config(
     calibrators: tuple[str, ...] = (CALIBRATOR_NAME,),
     max_rmse_vol_bp: float = 50.0,
+    fit: FitSettings | None = None,
 ) -> CalibrationConfig:
     """A mesh wider than the quoted band and a threshold the stub's fits comfortably clear."""
     return CalibrationConfig(
@@ -111,6 +145,7 @@ def make_calibration_config(
         grid=make_grid_spec(),
         weighting=make_weighting(),
         acceptance=Acceptance(max_rmse_vol_bp=max_rmse_vol_bp),
+        fit=fit,
     )
 
 
@@ -128,6 +163,7 @@ def make_position(underlying: str = UNDERLYING) -> Position:
 def make_risk_config(
     writer: str = WRITER_NAME,
     positions: tuple[Position, ...] | None = None,
+    output_path: Path | None = None,
 ) -> RiskConfig:
     """One at-the-money call on the near expiry, valued under a policy nothing here trips."""
     return RiskConfig(
@@ -137,6 +173,7 @@ def make_risk_config(
         freshness=FreshnessPolicy(warn_seconds=30.0, reject_seconds=120.0),
         settings=ReportSettings(bumps=BumpSpec(forward_rel=0.01, vol_abs=0.01)),
         writer=writer,
+        output_path=output_path,
     )
 
 
@@ -296,7 +333,7 @@ min_coverage_ratio = 0.6
 max_quiet_seconds = 30.0
 
 [calibration]
-calibrators = ["svi-scipy"]
+calibrators = ["svi-jax"]
 
 [calibration.grid]
 k_min = -0.4
@@ -332,7 +369,14 @@ strike = 60000.0
 kind = "CALL"
 quantity = 1.0
 """
-"""A complete, valid file. Every rejection test starts from this text and breaks one line."""
+"""A complete, valid file. Every rejection test starts from this text and breaks one line.
+
+It names ``svi-jax`` -- F3-A's calibrator, which no adapter is registered for -- so that a command
+driven over it stops at the registry instead of running a whole session. It was ``svi-scipy``
+until F2-07 registered that one; the property the tests need is *unregistered*, not any particular
+name, and the two optional sections F2-07 added (``[market.synthetic]`` and ``[calibration.fit]``)
+are deliberately absent here, because absent is the shape every file that does not use them has.
+"""
 
 
 def write_config(directory: Path, text: str = CONFIG_TOML) -> Path:

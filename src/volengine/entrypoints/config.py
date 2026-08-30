@@ -15,6 +15,23 @@ the ones the contexts own. That is why the TOML keys are spelled exactly like th
 fill: one vocabulary, no translation table to keep honest. ``Implementation.md`` lists the mirror
 types; ADR-022 records why they are not here.
 
+**Two adapters have settings of their own, and they are read here too.** ``SyntheticConfig``
+(the invented market of ``market_data/adapters/synthetic.py``) and ``FitSettings`` (the empirical
+half of the scipy fit) are numbers a deployment retunes without touching Python, which is exactly
+what ADR-012 asks to arrive as data -- so ``[market.synthetic]`` and ``[calibration.fit]`` fill
+those two types directly, on the same terms as every threshold above. The cost is that this module
+imports two ``*/adapters/`` modules, which until now only ``pipeline.default_adapters`` did --
+**ADR-028**, which supersedes that sentence of ADR-022 and records what the old claim was
+protecting. It buys the same thing the rest of the file buys: no mirror type, no second copy of
+seven guards.
+What has *not* changed is that a file still cannot reach an object -- ``provider``, ``calibrators``
+and ``writer`` are names, resolved by a registry that lives elsewhere.
+
+**Both sections are optional, and complete when present.** Absent means "the adapter's own
+defaults", which are argued for in its docstring and are what every test bends one knob of; a
+partial table would need this module to restate every value the file left out, which is the mirror
+type it just refused. So a file either says nothing about the synthetic feed or describes all of it.
+
 **Every failure is a ``ConfigError`` naming the table it came from.** A domain constructor raises
 ``ValueError("The reject_seconds must be above warn_seconds")``, which is the right message and
 the wrong context -- a traceback out of ``risk/domain/`` for a typo in a file tells an operator to
@@ -28,11 +45,13 @@ import math
 import tomllib
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from enum import StrEnum
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
+from volengine.market_data.adapters.synthetic import SVIParamsSpec, SyntheticConfig
 from volengine.market_data.domain.admissibility import AdmissibilityThresholds
 from volengine.market_data.domain.market_conventions import (
     DayCount,
@@ -41,6 +60,7 @@ from volengine.market_data.domain.market_conventions import (
     Numeraire,
 )
 from volengine.market_data.domain.snapshot_policy import SnapshotPolicyConfig
+from volengine.parametric_pricing.adapters.scipy_calibrator import FitSettings
 from volengine.parametric_pricing.application.acl import Weighting
 from volengine.parametric_pricing.application.calibrate_on_snapshot import Acceptance
 from volengine.parametric_pricing.application.grid_spec import GridSpec
@@ -49,6 +69,7 @@ from volengine.risk.domain.freshness_policy import FreshnessPolicy
 from volengine.risk.domain.portfolio import Portfolio, Position
 from volengine.risk.domain.pricing import OptionKindR
 from volengine.risk.domain.valuation import BumpSpec
+from volengine.shared_kernel.domain.instants import require_aware
 
 
 class ConfigError(Exception):
@@ -62,6 +83,42 @@ class ConfigError(Exception):
     It is not a ``MarketDataError`` or a ``RiskError`` and must never become one: those hierarchies
     are for conditions a market can produce, and a typo in a TOML file is not one of them.
     """
+
+
+SYNTHETIC_PROVIDER = "synthetic"
+"""The one provider that takes settings, and the name of the table that carries them.
+
+Spelled once, here, and imported by ``pipeline.default_adapters`` as the registry key: the table
+is named after the provider it configures, so the two spellings have to agree or a
+``[market.synthetic]`` beside ``provider = "constant"`` would be a block of numbers nobody reads
+and nobody reports.
+"""
+
+
+@dataclass(frozen=True, slots=True)
+class SyntheticSettings:
+    """What ``SyntheticProvider`` needs beyond the market's conventions: a market, and an origin.
+
+    Two fields rather than one because the origin is not part of ``SyntheticConfig``: the
+    generator takes it as a constructor argument, since a feed that reads the wall clock and a
+    feed replaying a fixed timeline are the same invented market seen twice. Pairing them here
+    keeps ``MarketConfig`` to one field for one provider.
+    """
+
+    config: SyntheticConfig
+    """The surface to generate, how badly to quote it, how often, and from which seed."""
+
+    start: datetime | None = None
+    """The instant the synthetic timeline begins at, or ``None`` to read the wall clock once.
+
+    Absent is the right default for a live-looking run and the wrong one for a reproducible one:
+    the stream is a function of ``seed`` *and* ``start``, so pinning both is what makes two runs
+    byte for byte identical. Aware, like every instant in this engine.
+    """
+
+    def __post_init__(self) -> None:
+        if self.start is not None:
+            require_aware(self.start, "The synthetic start")
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,6 +150,16 @@ class MarketConfig:
     max_skew_seconds: float
     """How far the venue's clock may sit from ours before its stamps are disbelieved (ADR-021)."""
 
+    synthetic: SyntheticSettings | None = None
+    """The invented market, when ``provider`` is :data:`SYNTHETIC_PROVIDER`, else ``None``.
+
+    Named after the one adapter it configures rather than held as an untyped bag of settings the
+    factory would parse (ADR-028): a ``Mapping[str, Any]`` reaching an adapter would move
+    validation out of this module, and with it the error that names the table. A second provider
+    with settings gets a second field, which is one line and stays checkable; what it must never
+    get is a shared key whose meaning depends on which name sits above it.
+    """
+
     @property
     def market_id(self) -> str:
         """Identity of the market, as every published event will spell it."""
@@ -109,6 +176,11 @@ class MarketConfig:
         if not math.isfinite(self.max_skew_seconds) or self.max_skew_seconds <= 0:
             raise ValueError(
                 f"The max_skew_seconds must be positive and finite, got {self.max_skew_seconds}"
+            )
+        if self.synthetic is not None and self.provider != SYNTHETIC_PROVIDER:
+            raise ValueError(
+                f"The settings of {SYNTHETIC_PROVIDER!r} were given to the provider "
+                f"{self.provider!r}, which would never read them"
             )
 
 
@@ -133,6 +205,13 @@ class CalibrationConfig:
     acceptance: Acceptance
     """The RMSE a slice must beat to go out rather than be republished stale (ADR-006)."""
 
+    fit: FitSettings | None = None
+    """The scipy calibrator's empirical tuning, or ``None`` for the settings it ships with.
+
+    Shared by every producer that wants it, like the mesh above, and read by the one that does:
+    ``flat-vol`` takes no tuning at all, and a file running it alone says nothing here.
+    """
+
     def __post_init__(self) -> None:
         if not self.calibrators:
             raise ValueError("At least one calibrator must be configured")
@@ -156,9 +235,20 @@ class RiskConfig:
     writer: str
     """Name of the adapter a finished report is handed to, e.g. ``"console"``."""
 
+    output_path: Path | None = None
+    """Where that adapter writes, for the ones that write to a file. ``None`` for a console.
+
+    Read as written, relative paths included: resolving one against the configuration file's own
+    directory would surprise anyone who typed it beside a command, and resolving it against the
+    working directory is what every other command-line tool does. Which writers require it is the
+    registry's business, not this type's -- ``console`` would have no use for one.
+    """
+
     def __post_init__(self) -> None:
         if not self.writer.strip():
             raise ValueError(f"The writer name must not be empty, got {self.writer!r}")
+        if self.output_path is not None and not str(self.output_path).strip():
+            raise ValueError("The output_path must not be empty")
 
 
 @dataclass(frozen=True, slots=True)
@@ -254,6 +344,71 @@ def _market(raw: Mapping[str, Any], where: str) -> MarketConfig:
             snapshot=_snapshot(_table(raw, "snapshot", where), f"{where}.snapshot"),
             provider=_text(raw, "provider", where),
             max_skew_seconds=_number(raw, "max_skew_seconds", where),
+            synthetic=_synthetic(raw, where),
+        ),
+    )
+
+
+def _synthetic(raw: Mapping[str, Any], where: str) -> SyntheticSettings | None:
+    """The invented market, when the file describes one.
+
+    Absent is not a defaulted table but a decision: the provider builds its own
+    ``SyntheticConfig``, whose defaults are a complete BTC-shaped market. Present, every key is
+    required -- see the module docstring on why there is no middle ground.
+    """
+    settings = _optional_table(raw, SYNTHETIC_PROVIDER, where)
+    if settings is None:
+        return None
+    place = f"{where}.{SYNTHETIC_PROVIDER}"
+    slices = tuple(
+        (
+            _days(table, "expiry_days", f"{place}.slice[{index}]"),
+            _slice_params(table, f"{place}.slice[{index}]"),
+        )
+        for index, table in enumerate(_tables(settings, "slice", place))
+    )
+    return _built(
+        place,
+        lambda: SyntheticSettings(
+            config=SyntheticConfig(
+                forward0=_number(settings, "forward0", place),
+                # The order of the slice tables is the order the chain is published in, and the
+                # mapping is keyed by the same tenors -- built from one array so the two cannot
+                # name different sets, which is an invariant `SyntheticConfig` would otherwise
+                # only be able to report after the fact.
+                expiries=tuple(expiry for expiry, _ in slices),
+                true_params=MappingProxyType(dict(slices)),
+                strikes_per_expiry=_integer(settings, "strikes_per_expiry", place),
+                log_moneyness_range=_pair(settings, "log_moneyness_range", place),
+                spread_bp=_number(settings, "spread_bp", place),
+                vol_noise_bp=_number(settings, "vol_noise_bp", place),
+                size=_number(settings, "size", place),
+                junk_quote_rate=_number(settings, "junk_quote_rate", place),
+                forward_move_rel=_number(settings, "forward_move_rel", place),
+                latency_seconds=_number(settings, "latency_seconds", place),
+                jitter_seconds=_number(settings, "jitter_seconds", place),
+                cycles=_integer(settings, "cycles", place),
+                interval_seconds=_number(settings, "interval_seconds", place),
+                seed=_integer(settings, "seed", place),
+            ),
+            # Absent means "read the wall clock", the same way an absent `max_quiet_seconds`
+            # means "no heartbeat": a live-looking run and a reproducible one are different
+            # deployments, not a default and its exception.
+            start=_optional_instant(settings, "start", place),
+        ),
+    )
+
+
+def _slice_params(raw: Mapping[str, Any], where: str) -> SVIParamsSpec:
+    """The five raw SVI parameters of one generated expiry."""
+    return _built(
+        where,
+        lambda: SVIParamsSpec(
+            a=_number(raw, "a", where),
+            b=_number(raw, "b", where),
+            rho=_number(raw, "rho", where),
+            m=_number(raw, "m", where),
+            sigma=_number(raw, "sigma", where),
         ),
     )
 
@@ -320,6 +475,27 @@ def _calibration(raw: Mapping[str, Any]) -> CalibrationConfig:
                     max_rmse_vol_bp=_number(acceptance, "max_rmse_vol_bp", f"{where}.acceptance")
                 ),
             ),
+            fit=_fit(raw, where),
+        ),
+    )
+
+
+def _fit(raw: Mapping[str, Any], where: str) -> FitSettings | None:
+    """The scipy calibrator's tuning, when the file states it."""
+    settings = _optional_table(raw, "fit", where)
+    if settings is None:
+        return None
+    place = f"{where}.fit"
+    return _built(
+        place,
+        lambda: FitSettings(
+            huber_scale_bp=_number(settings, "huber_scale_bp", place),
+            durrleman_penalty_bp=_number(settings, "durrleman_penalty_bp", place),
+            durrleman_mesh_nodes=_integer(settings, "durrleman_mesh_nodes", place),
+            durrleman_mesh_margin=_number(settings, "durrleman_mesh_margin", place),
+            min_quotes_for_free_shape=_integer(settings, "min_quotes_for_free_shape", place),
+            ridge_bp=_number(settings, "ridge_bp", place),
+            max_nfev=_integer(settings, "max_nfev", place),
         ),
     )
 
@@ -362,6 +538,7 @@ def _risk(raw: Mapping[str, Any]) -> RiskConfig:
                 ),
             ),
             writer=_text(raw, "writer", where),
+            output_path=_optional_path(raw, "output_path", where),
         ),
     )
 
@@ -412,6 +589,17 @@ def _table(raw: Mapping[str, Any], key: str, where: str) -> Mapping[str, Any]:
     return value
 
 
+def _optional_table(raw: Mapping[str, Any], key: str, where: str) -> Mapping[str, Any] | None:
+    """A table, or ``None`` when the key is simply absent.
+
+    Absence has to be distinguishable from an empty table: ``[market.synthetic]`` with nothing
+    under it is a file that meant to configure the feed and forgot, and it is refused key by key.
+    """
+    if key not in raw:
+        return None
+    return _table(raw, key, where)
+
+
 def _tables(raw: Mapping[str, Any], key: str, where: str) -> tuple[Mapping[str, Any], ...]:
     """An array of tables -- ``[[market]]`` -- which is how repetition is spelled in TOML."""
     value = _require(raw, key, where)
@@ -446,6 +634,21 @@ def _integer(raw: Mapping[str, Any], key: str, where: str) -> int:
     return value
 
 
+def _days(raw: Mapping[str, Any], key: str, where: str) -> timedelta:
+    """A count of days, as the duration TOML has no literal for.
+
+    ``timedelta`` refuses a NaN with a ``ValueError`` about converting a float, and overflows an
+    astronomical one with an ``OverflowError`` that no ``_built`` catches -- so both are turned
+    into the one message this module promises.
+    """
+    value = _number(raw, key, where)
+    try:
+        return timedelta(days=value)
+    except (ValueError, OverflowError) as failure:
+        message = f"{where}: {key!r} must be a usable number of days, got {value}"
+        raise ConfigError(message) from failure
+
+
 def _text(raw: Mapping[str, Any], key: str, where: str) -> str:
     value = _require(raw, key, where)
     if not isinstance(value, str):
@@ -465,6 +668,14 @@ def _pair(raw: Mapping[str, Any], key: str, where: str) -> tuple[float, float]:
     if not isinstance(value, list) or len(value) != 2:
         raise ConfigError(f"{where}: {key!r} must be an array of two numbers, got {value!r}")
     return _as_number(value[0], key, where), _as_number(value[1], key, where)
+
+
+def _optional_path(raw: Mapping[str, Any], key: str, where: str) -> Path | None:
+    """A filesystem path, or ``None`` when the key is absent. Not checked for existence here:
+    whether the path must be writable is the adapter's question, and it answers it by opening."""
+    if key not in raw:
+        return None
+    return Path(_text(raw, key, where))
 
 
 def _member[E: StrEnum](raw: Mapping[str, Any], key: str, where: str, kind: type[E]) -> E:
@@ -507,3 +718,10 @@ def _instant(raw: Mapping[str, Any], key: str, where: str) -> datetime:
     if value.tzinfo is None:
         raise ConfigError(f"{where}: {key!r} must carry a UTC offset, got the local time {value}")
     return value
+
+
+def _optional_instant(raw: Mapping[str, Any], key: str, where: str) -> datetime | None:
+    """An instant, or ``None`` when the key is absent."""
+    if key not in raw:
+        return None
+    return _instant(raw, key, where)

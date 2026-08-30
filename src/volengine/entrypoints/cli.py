@@ -1,9 +1,9 @@
 """The command line: four verbs, and the only place an event loop is started.
 
 Deliberately thin. Everything below it is already composed by ``pipeline.build_pipeline``, so what
-is left here is the three decisions a person makes when they type the command -- which file to
-read, which market to run, which producers to run it with -- plus turning a ``ConfigError`` into
-an exit code instead of a traceback.
+is left here is the decisions a person makes when they type the command -- which file to read,
+which market to run, which producers to run it with, and how long or how many reports to run for
+-- plus turning a ``ConfigError`` into an exit code instead of a traceback.
 
 **``record`` and ``replay`` are declared and refuse.** They belong to F3-B, which needs a
 ``RecordedProvider`` and a recorder adapter that do not exist yet. Declaring them now rather than
@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 from dataclasses import replace
 from pathlib import Path
 from typing import Annotated, NoReturn
@@ -58,6 +59,10 @@ MetricsOption = Annotated[
     bool,
     typer.Option("--metrics/--no-metrics", help="Log every metric the contexts emit."),
 ]
+DurationOption = Annotated[
+    float | None,
+    typer.Option("--duration", help="Stop after this many seconds of session."),
+]
 
 
 @app.command()
@@ -66,9 +71,29 @@ def run(
     market: MarketOption = None,
     calibrators: CalibratorsOption = None,
     metrics: MetricsOption = False,
+    duration: DurationOption = None,
 ) -> None:
-    """Ingest, calibrate and report continuously until the streams end or you interrupt."""
-    _drive(_configure(config, market, calibrators), metrics=metrics, max_reports=None)
+    """Ingest, calibrate and report until the streams end, the duration elapses or you interrupt.
+
+    ``--duration`` is the stopping rule a live feed needs and a finite one does not: a synthetic
+    session ends when it runs out of cycles and a websocket never does, so a bounded observation
+    of the second is otherwise only possible with an interrupt. It is on ``run`` alone --
+    ``report`` already stops at ``--count`` -- and it is counted on the engine's clock, so a
+    replay under a simulated clock is bounded by the session's own time rather than by ours
+    (ADR-028).
+    """
+    # Finiteness first, and joined with `or`: `nan <= 0` is `False`, so the ordering test alone
+    # would pass `--duration nan` down to `Pipeline.run`, whose own guard raises a `ValueError`
+    # this module does not catch -- a traceback and exit 1 where the contract is a message and
+    # exit 2. An `inf` slips through the same hole and sleeps forever.
+    if duration is not None and (not math.isfinite(duration) or duration <= 0):
+        _fail(f"--duration must be positive and finite, got {duration}", CONFIG_EXIT_CODE)
+    _drive(
+        _configure(config, market, calibrators),
+        metrics=metrics,
+        max_reports=None,
+        duration=duration,
+    )
 
 
 @app.command()
@@ -154,7 +179,12 @@ def _only_calibrators(config: AppConfig, names: str) -> AppConfig:
     )
 
 
-def _drive(config: AppConfig, metrics: bool, max_reports: int | None) -> None:
+def _drive(
+    config: AppConfig,
+    metrics: bool,
+    max_reports: int | None,
+    duration: float | None = None,
+) -> None:
     """Build the pipeline and run it, translating a wiring failure into an exit code.
 
     The one place in the engine that configures ``logging``, and it does so only for ``--metrics``.
@@ -173,7 +203,7 @@ def _drive(config: AppConfig, metrics: bool, max_reports: int | None) -> None:
     except ConfigError as failure:
         _fail(str(failure), CONFIG_EXIT_CODE)
     try:
-        asyncio.run(pipeline.run(max_reports=max_reports))
+        asyncio.run(pipeline.run(max_reports=max_reports, duration_seconds=duration))
     except KeyboardInterrupt:  # pragma: no cover - requires a real signal
         # An interrupt is how a session is meant to end, so it is not a traceback. `asyncio.run`
         # has already cancelled the tasks, which is what closes the providers.

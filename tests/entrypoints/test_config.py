@@ -9,7 +9,7 @@ operator has no reason to be reading.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, time
+from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
 
 import pytest
@@ -163,3 +163,199 @@ def test_the_same_calibrator_may_not_be_listed_twice(tmp_path: Path) -> None:
 def test_an_empty_calibrator_list_is_refused(tmp_path: Path) -> None:
     with pytest.raises(ConfigError, match="At least one calibrator"):
         load(tmp_path, replacing(CONFIG_TOML, "calibrators =", "calibrators = []"))
+
+
+# --- the two adapter sections (F2-07)
+
+
+SYNTHETIC_TOML = """
+[market.synthetic]
+forward0 = 50000.0
+strikes_per_expiry = 7
+log_moneyness_range = [-0.2, 0.2]
+spread_bp = 150.0
+vol_noise_bp = 25.0
+size = 5.0
+junk_quote_rate = 0.01
+forward_move_rel = 0.001
+latency_seconds = 0.01
+jitter_seconds = 0.02
+cycles = 4
+interval_seconds = 0.5
+seed = 7
+
+[[market.synthetic.slice]]
+expiry_days = 30.0
+a = 0.020
+b = 0.050
+rho = -0.30
+m = 0.0
+sigma = 0.20
+
+[[market.synthetic.slice]]
+expiry_days = 90.0
+a = 0.055
+b = 0.090
+rho = -0.25
+m = 0.0
+sigma = 0.25
+"""
+"""The invented market, appended to the valid file. Every value differs from the adapter's own
+default, so a test asserting one of them cannot pass on a section that was never read."""
+
+
+def synthetic(text: str = CONFIG_TOML) -> str:
+    """The valid file, quoted by the synthetic feed and carrying its settings.
+
+    The provider has to change with the section: a ``[market.synthetic]`` beside any other name
+    is refused, which is its own test below.
+    """
+    return replacing(text, "provider =", 'provider = "synthetic"') + SYNTHETIC_TOML
+
+
+def with_start(text: str, start: str) -> str:
+    """The same file with an origin pinned *inside* the synthetic table.
+
+    Appended after the slice array it would belong to the last slice instead, which TOML would
+    accept and the loader would then blame on the wrong table.
+    """
+    return replacing(text, "seed =", f"seed = 7\nstart = {start}")
+
+
+FIT_TOML = """
+[calibration.fit]
+huber_scale_bp = 80.0
+durrleman_penalty_bp = 5000.0
+durrleman_mesh_nodes = 21
+durrleman_mesh_margin = 0.25
+min_quotes_for_free_shape = 4
+ridge_bp = 1.0
+max_nfev = 300
+"""
+
+
+def test_the_synthetic_table_fills_the_generator_own_type(tmp_path: Path) -> None:
+    """No mirror type: the file builds the ``SyntheticConfig`` the adapter itself declares."""
+    settings = load(tmp_path, synthetic()).markets[0].synthetic
+
+    assert settings is not None
+    assert settings.config.forward0 == 50_000.0
+    assert settings.config.strikes_per_expiry == 7
+    assert settings.config.log_moneyness_range == (-0.2, 0.2)
+    assert settings.config.cycles == 4
+    assert settings.config.seed == 7
+
+
+def test_the_slices_become_the_expiries_and_the_parameters_at_once(tmp_path: Path) -> None:
+    """One array of tables fills two fields, which is what keeps them naming the same set.
+
+    ``SyntheticConfig`` refuses an expiry with no parameters and a parameter set with no expiry;
+    reading them from one array means that invariant cannot be broken by a file at all.
+    """
+    settings = load(tmp_path, synthetic()).markets[0].synthetic
+
+    assert settings is not None
+    assert settings.config.expiries == (timedelta(days=30), timedelta(days=90))
+    assert set(settings.config.true_params) == set(settings.config.expiries)
+    assert settings.config.true_params[timedelta(days=90)].sigma == 0.25
+
+
+def test_a_market_with_no_synthetic_table_carries_none(tmp_path: Path) -> None:
+    """Absent is not a defaulted table: the adapter, not the loader, owns what absence means."""
+    assert load(tmp_path).markets[0].synthetic is None
+
+
+def test_an_absent_start_leaves_the_feed_on_the_wall_clock(tmp_path: Path) -> None:
+    settings = load(tmp_path, synthetic()).markets[0].synthetic
+
+    assert settings is not None
+    assert settings.start is None
+
+
+def test_a_pinned_start_is_read_with_its_offset(tmp_path: Path) -> None:
+    """The other half of reproducibility: the stream is a function of the seed *and* this."""
+    settings = load(tmp_path, with_start(synthetic(), "2026-09-01T00:00:00Z")).markets[0].synthetic
+
+    assert settings is not None
+    assert settings.start == datetime(2026, 9, 1, tzinfo=UTC)
+
+
+def test_a_naive_start_is_refused_by_name(tmp_path: Path) -> None:
+    with pytest.raises(ConfigError, match="UTC offset"):
+        load(tmp_path, with_start(synthetic(), "2026-09-01T00:00:00"))
+
+
+def test_a_missing_key_in_the_synthetic_table_names_the_table(tmp_path: Path) -> None:
+    """Complete when present: there is no partial override to fall back through."""
+    text = without(synthetic(), "seed")
+
+    with pytest.raises(ConfigError, match=r"market\[0\].synthetic: the key 'seed'"):
+        load(tmp_path, text)
+
+
+def test_a_number_of_days_the_calendar_cannot_hold_names_its_slice(tmp_path: Path) -> None:
+    """``timedelta`` answers a NaN with a ``ValueError`` about floats, which names nothing."""
+    text = replacing(synthetic(), "expiry_days = 30.0", "expiry_days = nan")
+
+    with pytest.raises(ConfigError, match=r"slice\[0\]: 'expiry_days'"):
+        load(tmp_path, text)
+
+
+def test_a_slice_the_generator_refuses_is_blamed_on_its_own_table(tmp_path: Path) -> None:
+    text = replacing(synthetic(), "sigma = 0.20", "sigma = 0.0")
+
+    with pytest.raises(ConfigError, match=r"slice\[0\]: The SVI parameter sigma"):
+        load(tmp_path, text)
+
+
+def test_two_slices_on_one_expiry_are_refused(tmp_path: Path) -> None:
+    text = replacing(synthetic(), "expiry_days = 90.0", "expiry_days = 30.0")
+
+    with pytest.raises(ConfigError, match="distinct"):
+        load(tmp_path, text)
+
+
+def test_settings_given_to_a_provider_that_would_never_read_them_are_refused(
+    tmp_path: Path,
+) -> None:
+    """The failure mode a silently ignored section has: a block of numbers nobody reads.
+
+    The table is named after the provider it configures, which is what makes the pairing
+    checkable without the loader knowing anything else about the registry.
+    """
+    with pytest.raises(ConfigError, match="which would never read them"):
+        load(tmp_path, CONFIG_TOML + SYNTHETIC_TOML)
+
+
+def test_the_fit_table_fills_the_calibrator_own_type(tmp_path: Path) -> None:
+    fit = load(tmp_path, CONFIG_TOML + FIT_TOML).calibration.fit
+
+    assert fit is not None
+    assert fit.huber_scale_bp == 80.0
+    assert fit.durrleman_mesh_nodes == 21
+    assert fit.ridge_bp == 1.0
+    assert fit.max_nfev == 300
+
+
+def test_a_file_with_no_fit_table_leaves_the_tuning_absent(tmp_path: Path) -> None:
+    """A file running ``flat-vol`` alone states nothing here, and must not have to."""
+    assert load(tmp_path).calibration.fit is None
+
+
+def test_a_fit_value_the_calibrator_refuses_is_blamed_on_its_table(tmp_path: Path) -> None:
+    text = replacing(CONFIG_TOML + FIT_TOML, "max_nfev", "max_nfev = 0")
+
+    with pytest.raises(ConfigError, match=r"calibration\.fit: The evaluation budget"):
+        load(tmp_path, text)
+
+
+def test_the_output_path_is_read_as_written(tmp_path: Path) -> None:
+    """Relative and unresolved: against the working directory, like every other tool."""
+    text = replacing(CONFIG_TOML, 'writer = "console"', 'writer = "csv"\noutput_path = "out.csv"')
+
+    assert load(tmp_path, text).risk.output_path == Path("out.csv")
+
+
+def test_a_writer_with_no_output_path_carries_none(tmp_path: Path) -> None:
+    """Which writers need one is the registry's question, not this module's."""
+    assert load(tmp_path).risk.output_path is None

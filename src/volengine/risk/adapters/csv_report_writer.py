@@ -30,11 +30,10 @@ than the console's fixed decimals. A person needs a gamma of ``1.7e-08`` rounded
 readable; an analysis needs the float that was actually priced with, and a file that had lost four
 digits could not be compared against the run that produced it.
 
-**Not registered in ``default_adapters()`` yet**, and the seam is in ``docs/SEAMS.md``:
-``RiskConfig`` names its writer but carries no path, and a writer factory receives the risk
-configuration and nothing else. F2-07 owns the TOML, the same way it owns ``FitSettings`` and
-``SyntheticConfig``; a field added here would be configuration nothing reads, which is what
-ADR-012 asks configuration not to be. Until then this adapter is constructed by tests only.
+**Reached as ``writer = "csv"`` since F2-07**, with the file it appends to named by an
+``output_path`` beside it in the risk section. Both are checked while the composition root is
+still wiring: a ``csv`` writer with no path is a ``ConfigError``, and so is a path this
+constructor cannot open.
 """
 
 from __future__ import annotations

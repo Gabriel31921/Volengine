@@ -163,13 +163,17 @@ def test_the_shipped_example_names_only_adapters_this_build_registers() -> None:
     """The guard on the file a first-time reader runs, without pinning it to a date.
 
     A renamed adapter, a moved key or a threshold the domain has since tightened all show up
-    here. What is deliberately *not* asserted is the position's expiry: it is a fixed instant in a
-    file that has no way to say "next year", so it is documented as needing a bump rather than
-    guarded by a test that would fail on a calendar rather than on a change anybody made.
+    here. Membership rather than equality against the registry, since F2-07: the registry holds
+    six names and this file names three of them, so an equality would only assert that the two
+    grew at the same rate. That the registry holds exactly what it should is
+    ``test_pipeline.py``'s job. What is deliberately *not* asserted is the position's expiry: it
+    is a fixed instant in a file that has no way to say "next year", so it is documented as
+    needing a bump rather than guarded by a test that would fail on a calendar rather than on a
+    change anybody made.
     """
     config = load_config(EXAMPLE)
     registry = default_adapters()
 
-    assert [market.provider for market in config.markets] == list(registry.providers)
-    assert list(config.calibration.calibrators) == list(registry.calibrators)
+    assert all(market.provider in registry.providers for market in config.markets)
+    assert all(name in registry.calibrators for name in config.calibration.calibrators)
     assert config.risk.writer in registry.writers

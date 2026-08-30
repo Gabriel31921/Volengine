@@ -227,9 +227,10 @@ class FitSettings:
     Every field has a default, so ``FitSettings()`` is a working calibrator and a test bends the
     one knob it is about. They are constructor arguments rather than module constants because they
     will move against real data (that is what makes them empirical) and because ADR-012 wants a
-    number a deployment may want to change to arrive from outside the code. They are *not* in
-    ``entrypoints/config.py`` yet: F2-07 owns the TOML, and inventing a section here that no file
-    reads would be the guesswork ADR-012 exists to prevent. Recorded in ``docs/SEAMS.md``.
+    number a deployment may want to change to arrive from outside the code. Since F2-07 that is
+    where they come from: ``[calibration.fit]`` fills this type key by key. The section stays
+    optional -- absent, these defaults apply, which is what a file running a calibrator that takes
+    no tuning needs -- and that remaining half is recorded in ``docs/SEAMS.md``.
     """
 
     huber_scale_bp: float = 100.0

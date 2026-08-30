@@ -35,7 +35,7 @@ construction is SSVI, deferred to its own milestone.
 **Analytic derivatives, not finite differences.** With ``y = k - m`` and
 ``r = sqrt(y^2 + sigma^2)``::
 
-    w   = a + b * (rho * y + r)
+    w   = a + b * (rho * y + r)          (the shared kernel's, not restated here)
     w'  = b * (rho + y / r)
     w'' = b * sigma^2 / r^3
 
@@ -85,10 +85,17 @@ def _curve_and_derivatives(
 ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
     """``(w, w', w'')`` of the raw SVI curve at every point of ``k``, in closed form.
 
-    The three expressions are derived in the module docstring. ``r`` is bounded below by
-    ``sigma``, which ``SVIParams`` guarantees strictly positive, so neither the division by
-    ``r`` nor the one by ``r^3`` can fail here -- the only division that needs a guard in this
-    module is the one by ``w``, and it lives in :func:`durrleman_g` where ``w`` is checked.
+    The three expressions are derived in the module docstring. **``w`` is not rewritten here**:
+    it comes from :meth:`SVIParams.total_variance`, and so from the one copy of the raw SVI form
+    the shared kernel holds (ADR-026). Only the two derivatives are written in this module,
+    because they are different formulas rather than another spelling of the same one. The cost
+    is that ``r`` is computed twice per grid point, which is one square root against the
+    optimiser's own arithmetic and is not where this loop's time goes.
+
+    ``r`` is bounded below by ``sigma``, which ``SVIParams`` guarantees strictly positive, so
+    neither the division by ``r`` nor the one by ``r^3`` can fail here -- the only division that
+    needs a guard in this module is the one by ``w``, and it lives in :func:`durrleman_g` where
+    ``w`` is checked.
 
     Private because the published vocabulary of this module is the three measures below; the
     derivatives are the machinery under them. Its own tests reach in anyway, and say why: a sign
@@ -98,7 +105,7 @@ def _curve_and_derivatives(
     """
     y = k - params.m
     r = np.sqrt(y * y + params.sigma * params.sigma)
-    w = params.a + params.b * (params.rho * y + r)
+    w = params.total_variance(k)
     w_prime = params.b * (params.rho + y / r)
     w_second = params.b * params.sigma * params.sigma / (r * r * r)
     return w, w_prime, w_second

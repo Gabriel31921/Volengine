@@ -27,9 +27,19 @@ from ``m`` the square root becomes ``|k - m|`` and the curve is asymptotically l
 ``b * (1 + rho)`` on the right, ``b * (rho - 1)`` on the left. Those two slopes are what a
 sign error in ``rho`` corrupts, and they are the reason the wings are tested numerically.
 
+**That form itself lives in ``shared_kernel/domain/svi.py``, not here** (ADR-026). What this
+module owns is the *type*: which five numbers make a fitted slice, which invariants a fit's
+output must satisfy and which it must deliberately not, and how the whole thing maps into the
+unconstrained space an optimiser searches. Market Data's generator writes an ``SVIParamsSpec``
+with the same five fields and stricter invariants, and it must -- a specification of what to
+generate is not the output of a fit -- but the two are not allowed to disagree about the
+mathematics, because that context's surface is what this context's calibrator is measured
+against, and a sign slip on both sides cancels.
+
 Nothing here imports jax, scipy or ``contracts/``: what lives in this module is what SVI
 *means*, and none of it depends on which library computed the numbers (see the package
-docstring). numpy is allowed, and is used for the vectorised evaluation only.
+docstring). numpy is allowed, and is used for the vectorised evaluation only -- which is the
+one thing that cannot move to the kernel, since rule 1 confines it to the standard library.
 """
 
 from __future__ import annotations
@@ -44,6 +54,7 @@ from typing import Final, overload
 import numpy as np
 from numpy.typing import NDArray
 
+from volengine.shared_kernel.domain import svi
 from volengine.shared_kernel.domain.instants import require_aware
 
 SOFTPLUS_LINEAR_ABOVE: Final[float] = 20.0
@@ -259,15 +270,17 @@ class SVIParams:
         """Lowest value the curve attains, ``a + b * sigma * sqrt(1 - rho^2)``.
 
         Closed form rather than a search: differentiating ``w`` and solving gives a single
-        interior minimum, and substituting it back leaves this expression. It is the quantity
-        the constructor checks, because a curve dipping below zero somewhere is claiming a
-        negative variance at that strike -- not an arbitrage to be measured and reported, but
-        an object that is not a volatility surface at all.
+        interior minimum, and substituting it back leaves this expression, which the shared
+        kernel derives in full. It is the quantity the constructor checks, because a curve
+        dipping below zero somewhere is claiming a negative variance at that strike -- not an
+        arbitrage to be measured and reported, but an object that is not a volatility surface
+        at all.
 
-        Evaluated on the already-validated fields, so ``1 - rho^2`` is strictly positive and
-        the square root is always real.
+        Called during ``__post_init__``, **after** the guard on ``rho``, so the kernel's own
+        domain check on ``1 - rho^2`` can never be the one that fires: a bad ``rho`` is reported
+        by this class, in this class's words.
         """
-        return self.a + self.b * self.sigma * math.sqrt(1.0 - self.rho * self.rho)
+        return svi.min_total_variance(a=self.a, b=self.b, rho=self.rho, sigma=self.sigma)
 
     @overload
     def total_variance(self, k: float) -> float: ...
@@ -281,19 +294,31 @@ class SVIParams:
         Accepts one log-moneyness or a whole grid of them. The two overloads exist so that the
         return type follows the argument type instead of being a union every caller has to
         narrow: a loss function feeds an array and wants an array back, while a test or a single
-        quote feeds a float and wants a float. One ``np.asarray``-based implementation serves
-        both, and the scalar branch converts the resulting 0-d array back to a plain ``float``
-        so that a ``numpy`` scalar never escapes into code that expected a builtin.
+        quote feeds a float and wants a float.
+
+        **The closed form itself lives in the shared kernel** (ADR-026), and the scalar branch
+        is nothing but a call into it. The array branch cannot be: rule 1 keeps numpy out of the
+        kernel, and evaluating a dense grid one Python call at a time is not an option inside an
+        optimiser's loss. So what is written here is the *elementwise image* of
+        ``shared_kernel.domain.svi.total_variance`` and nothing else -- same operations, same
+        order, therefore the same double to the last bit --  and
+        ``test_total_variance_agrees_between_scalar_and_array_input`` is what keeps it that way,
+        since the scalar it is compared against is now the kernel's own answer.
 
         The result is guaranteed non-negative by the constructor's minimum-variance invariant,
         which is what lets ``implied_vol`` take a square root without a guard.
         """
-        centred: NDArray[np.float64] = np.asarray(k, dtype=np.float64) - self.m
+        if not isinstance(k, np.ndarray):
+            # ``float`` because "scalar" reaches this branch as a ``np.float64`` often enough --
+            # an element pulled out of a grid -- and a numpy scalar escaping into code that
+            # asked for a builtin is only ever noticed by whatever serialises it.
+            return float(
+                svi.total_variance(k, a=self.a, b=self.b, rho=self.rho, m=self.m, sigma=self.sigma)
+            )
+        centred: NDArray[np.float64] = k - self.m
         root: NDArray[np.float64] = np.sqrt(centred * centred + self.sigma * self.sigma)
         w: NDArray[np.float64] = self.a + self.b * (self.rho * centred + root)
-        if isinstance(k, np.ndarray):
-            return w
-        return float(w)
+        return w
 
     @overload
     def implied_vol(self, k: float, tenor_years: float) -> float: ...

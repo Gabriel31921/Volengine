@@ -108,7 +108,14 @@ def test_total_variance_returns_an_array_of_the_same_shape_for_an_array() -> Non
 
 
 def test_total_variance_agrees_between_scalar_and_array_input() -> None:
-    """The two overloads are one implementation, and this is what keeps them one."""
+    """The two overloads are no longer one implementation, and this is what keeps them equal.
+
+    Since ADR-026 the scalar branch is a call into ``shared_kernel.domain.svi.total_variance``
+    and the array branch is a numpy expression that cannot be, because rule 1 keeps numpy out of
+    the kernel. So the scalar side of this comparison *is* the kernel's answer, and the test is
+    what pins the vectorised path to it: a wing evaluated one way in the loss and another way in
+    a diagnostic is a difference no downstream assertion would attribute to the right place.
+    """
     params = make_params()
     grid = np.array([-0.4, 0.0, 0.25])
     one_by_one = [params.total_variance(float(k)) for k in grid]

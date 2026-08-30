@@ -428,12 +428,20 @@ class CalibrationResult:
     """
 
     n_iterations: int
-    """Total optimiser iterations across the surface. Non-negative.
+    """What the search cost, summed over the surface. Non-negative.
 
-    Zero is legal and meaningful: a warm start that lands on the optimum from the previous
-    snapshot, which is the normal case in a calm market and precisely what Design 5.6 is
-    designed to produce. This field must therefore never be tested for truthiness -- ``not 0`` is
-    ``True`` -- and the cheapest possible cycle is the one that would be misread as a failure.
+    The unit is the producer's own: whatever quantity its optimiser actually reports, which is
+    the only honest measure of effort a caller can be given. An optimiser that publishes no
+    iteration count reports what it does publish -- the scipy baseline reports residual
+    evaluations, and why is ADR-027 -- so two producers are comparable on this field only once
+    both are known to be counting the same thing. That is a condition of the comparison of
+    Design 5.7, not a guarantee of this type.
+
+    Zero is legal and meaningful: a calibrator with nothing to search reports it, and so would a
+    producer counting iterations whose warm start lands on the optimum from the previous
+    snapshot -- the normal case in a calm market, and precisely what Design 5.6 is designed to
+    produce. This field must therefore never be tested for truthiness -- ``not 0`` is ``True`` --
+    and the cheapest possible cycle is the one that would be misread as a failure.
     """
 
     duration_ms: float

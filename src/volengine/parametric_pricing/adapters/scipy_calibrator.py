@@ -58,6 +58,11 @@ through the constructor so that F2-07 can feed them from TOML without reopening 
 *bounds*, by contrast, are module constants on purpose: ``at_bound`` is half of the acceptance
 rule and ADR-021 says that half is not configurable, so a deployment that could widen a bound
 until nothing was ever pinned is a deployment that eventually does.
+
+Every mechanism above that ``Plan.md`` and ``Implementation.md`` do not name -- the ridge, the
+residual scaling, the cold retry, the barrier, the non-configurable box, and ``n_iterations``
+carrying an evaluation count -- is collected in **ADR-027**, which is where the reasoning is
+recorded once rather than inferred from five docstrings.
 """
 
 from __future__ import annotations
@@ -680,7 +685,10 @@ class ScipyCalibrator:
             ``n_iterations`` is the total residual evaluation count across every attempt, retries
             included. ``least_squares`` reports no iteration count of its own, and the evaluation
             count is the honest measure of what a fit cost -- it is also the quantity the JAX
-            comparison of Design 5.7 will be read against.
+            comparison of Design 5.7 will be read against. The field's unit is the producer's own
+            for exactly this reason, and the change of meaning is recorded in ADR-027: unlike the
+            flat calibrator's, this producer's count is never zero, since the residual is
+            evaluated at ``x0`` before anything is decided.
 
         Raises:
             CalibrationError: Only if the optimiser returns a point that is not a surface. A poor

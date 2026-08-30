@@ -65,6 +65,11 @@ close naturally in a later phase.
 - **Bilinear interpolation does not inherit no-arbitrage** between nodes. Past the last tenor a flat
   total variance means the implied vol decays as `1/sqrt(T)`: a two-year option off a one-year grid
   is priced at about 71% of the one-year vol.
+- **`CsvReportWriter` has no TOML home.** `RiskConfig.writer` names an adapter but carries no
+  output path, and `WriterFactory` receives the risk configuration and nothing else, so
+  `default_adapters()` registers `console` alone and the CSV writer is constructed by tests only.
+  F2-07 owns the wiring, on the same terms as `FitSettings` and `SyntheticConfig`: a path field
+  added before there is a factory to read it would be configuration nothing loads (ADR-012).
 - **Risk's numerical greeks carry the grid's kinks** as well as the bump's truncation error. The
   at-the-money gamma of the test surface is about twice the analytic value — a fact Design §7.4
   wants visible, not a defect.

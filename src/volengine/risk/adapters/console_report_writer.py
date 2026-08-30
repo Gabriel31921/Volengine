@@ -3,7 +3,7 @@
 The first implementation of ``ReportWriter``, and the one the walking skeleton ends at: without
 it a run crosses all four contexts and leaves no trace anyone can see. Everything the port keeps
 out of the domain lives here and only here -- column widths, decimal places, the order of the
-fields, what a rejection looks like -- so that the CSV writer of F3-E is a sibling of this module
+fields, what a rejection looks like -- so that the CSV writer of F2-06 is a sibling of this module
 rather than an edit to it.
 
 **A rejected report is printed like any other.** ``FreshnessDecision.REJECT`` carries no valued

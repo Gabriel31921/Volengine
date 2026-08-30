@@ -6,7 +6,12 @@ dist/
 wheels/
 *.egg-info
 
-scripts/
+# Workstation-local agent tooling (setup_agents.sh, gate-commit.sh) stays out of the tree.
+# scripts/verify.sh is the exception and is committed on purpose: it is the gate CI runs, so a
+# fresh clone must be able to run it too (ADR-024). The pattern is `scripts/*` and not `scripts/`
+# because git cannot re-include a file whose parent directory is itself excluded.
+scripts/*
+!scripts/verify.sh
 
 # Virtual environments
 .venv

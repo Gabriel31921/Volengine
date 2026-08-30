@@ -32,6 +32,7 @@ in the current state.
 | [021](0021-acl-and-event-decisions-of-f1-06.md) | ACL and event decisions of F1-06 | Accepted |
 | [022](0022-composition-root-departures-of-f1-07.md) | Composition-root departures of F1-07 | Accepted |
 | [023](0023-flat-vol-departure-of-f1-08.md) | `FlatVolCalibrator`'s departure from `Plan.md` in F1-08 | Accepted |
+| [024](0024-one-gate-script-run-by-developers-agents-and-ci.md) | One gate script, run by developers, agents and CI | Accepted |
 
 ADR-001 to ADR-010 are extracted from the design document. ADR-011 onward were taken during
 implementation and exist only here.

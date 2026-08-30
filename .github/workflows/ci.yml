@@ -1,0 +1,46 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Least privilege: the job reads the code and nothing else. It publishes no artefact and needs no
+# OIDC token, so it gets neither.
+permissions:
+  contents: read
+
+# One run per ref. Unlike the docs deployment, a superseded CI run is worth cancelling: its verdict
+# is about a commit nobody will look at again, and nothing is left half-written when it dies.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      # Installs the Python pinned by requires-python and the locked dev environment: pytest,
+      # hypothesis, ruff, mypy and import-linter on top of numpy, scipy and typer. jax and torch
+      # are optional extras that arrive in F3-A and F3-C; nothing this workflow runs imports them,
+      # and the domain is forbidden from doing so by an import-linter contract.
+      #
+      # --frozen: the lockfile is used as committed. A pyproject.toml edited without re-locking
+      # fails here instead of resolving to something no developer has run.
+      - name: Sync the environment
+        run: uv sync --frozen --group dev
+
+      # The gate itself lives in the repository, not in this file. scripts/verify.sh runs pytest,
+      # ruff, ruff format --check, mypy and lint-imports, and it is the same script the developer
+      # and the review agents run — one list, three callers, no drift (ADR-024). Adding a check
+      # means editing that script, and it reaches CI in the same commit.
+      - name: Verify
+        run: bash scripts/verify.sh

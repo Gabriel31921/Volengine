@@ -51,7 +51,13 @@ uv run pytest                # tests
 uv run ruff check .          # lint
 uv run lint-imports          # import rules between layers
 uv run mypy                  # type checking
+
+bash scripts/verify.sh       # all of the above, in the order CI runs them
 ```
+
+`scripts/verify.sh` is the single definition of "healthy": the developer, the review agents and
+`.github/workflows/ci.yml` all run that one script, so there is no second list to keep in step
+(ADR-024).
 
 ## Documentation
 

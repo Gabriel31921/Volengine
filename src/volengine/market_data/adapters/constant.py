@@ -144,8 +144,18 @@ class ConstantProvider:
             raise ValueError(f"The size must be non-negative and finite, got {size}")
         if not log_moneyness:
             raise ValueError("The chain needs at least one strike")
+        # The elements, not only the emptiness: the docstring promises a plain `ValueError` for
+        # anything that could not describe a chain, and without these two loops a `0.0` tenor
+        # escapes as `ExpiredInstrumentError` from deep inside the stream and a NaN one as the
+        # stdlib's "cannot convert float NaN to integer" -- neither of which names the argument.
+        if not all(math.isfinite(k) for k in log_moneyness):
+            raise ValueError(f"Every log-moneyness must be finite, got {tuple(log_moneyness)}")
         if not tenor_days:
             raise ValueError("The chain needs at least one expiry")
+        if not all(math.isfinite(days) and days > 0 for days in tenor_days):
+            raise ValueError(
+                f"Every tenor must be a positive finite number of days, got {tuple(tenor_days)}"
+            )
         if not math.isfinite(spread_rel) or not 0 < spread_rel < 2:
             raise ValueError(
                 f"The relative spread must lie strictly inside (0, 2), got {spread_rel}"

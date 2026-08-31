@@ -359,3 +359,26 @@ def test_the_output_path_is_read_as_written(tmp_path: Path) -> None:
 def test_a_writer_with_no_output_path_carries_none(tmp_path: Path) -> None:
     """Which writers need one is the registry's question, not this module's."""
     assert load(tmp_path).risk.output_path is None
+
+
+def test_a_blank_output_path_is_refused_by_the_reader_rather_than_by_the_writer(
+    tmp_path: Path,
+) -> None:
+    """``Path("")`` is ``PosixPath('.')``, so ``RiskConfig``'s own guard never sees this one.
+
+    The check has to happen on the raw string, and it has to happen here: left to the adapter it
+    arrives as an ``OSError`` about ``'.'``, naming a directory the operator never typed instead
+    of the line they did.
+    """
+    text = replacing(CONFIG_TOML, 'writer = "console"', 'writer = "csv"\noutput_path = "   "')
+
+    with pytest.raises(ConfigError, match=r"risk: 'output_path' must not be empty"):
+        load(tmp_path, text)
+
+
+def test_an_output_path_of_one_dot_is_still_the_working_directory(tmp_path: Path) -> None:
+    """The guard above rejects blankness, not the path the blank used to collapse into: ``"."``
+    is a thing an operator can legitimately write, and the writer is what refuses it."""
+    text = replacing(CONFIG_TOML, 'writer = "console"', 'writer = "csv"\noutput_path = "."')
+
+    assert load(tmp_path, text).risk.output_path == Path(".")

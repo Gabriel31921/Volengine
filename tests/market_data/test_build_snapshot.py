@@ -115,11 +115,16 @@ class SliceLosingChain(QuoteChain):
 
     Subclassing the concrete aggregate rather than faking the port, because there is no port: the
     use case holds a ``QuoteChain``, which is this context's aggregate root and not a seam.
+
+    ``lose`` is switchable because the emptiness guard is only observable across two cycles: what
+    it must not do is stamp the cadence on the way out.
     """
+
+    lose = True
 
     def snapshot(self, now: datetime) -> ChainSnapshot:
         real = super().snapshot(now)
-        return replace(real, slices=())
+        return replace(real, slices=()) if self.lose else real
 
 
 def test_a_view_with_no_slices_is_never_published() -> None:
@@ -135,15 +140,21 @@ def test_a_view_with_no_slices_is_never_published() -> None:
 def test_an_empty_view_does_not_consume_the_cadence() -> None:
     """The next usable cycle must publish at once rather than wait out another interval.
 
-    This is the reason ``last_emit`` is advanced after the emptiness check and not before it.
+    The cadence is stamped after the emptiness check and not before it, which is a claim about
+    the *next* cycle and is asserted as one: the clock does not move between the two calls, so a
+    use case that had stamped it on the empty cycle would answer ``None`` here for another sixty
+    seconds. Asserting the timestamp instead would pin the mechanism rather than the rule.
     """
     chain = SliceLosingChain(make_conventions(), make_thresholds())
     policy = make_snapshot_policy(cadence_seconds=60.0)
     use_case, _, _, _ = make_use_case(chain=chain, policy=policy)
     quote_the_chain(chain)
-    use_case.build()
 
-    assert use_case.last_emit is None
+    assert use_case.build() is None
+
+    chain.lose = False
+
+    assert use_case.build() is not None
 
 
 # --- the movement filter, and the baseline the use case owns
@@ -225,17 +236,6 @@ def test_a_cycle_that_published_nothing_does_not_consume_a_sequence_number() -> 
 
     assert published is not None
     assert published.snapshot_id.endswith("00000000")
-
-
-def test_the_last_emission_is_readable_and_starts_absent() -> None:
-    use_case, chain, _, _ = make_use_case()
-
-    assert use_case.last_emit is None
-
-    quote_the_chain(chain)
-    use_case.build()
-
-    assert use_case.last_emit == NOW
 
 
 # --- what the cycle reports

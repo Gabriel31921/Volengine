@@ -15,7 +15,9 @@ are the reason the split is worth a module of its own:
   handlers. With the loop inside, a replay would have to simulate the bus.
 * **ADR-005.** The heavy work is CPU-bound and belongs on a named thread pool. Whoever owns the
   loop is whoever calls ``run_in_executor``, so keeping it out here lets the composition root put a
-  handler on a pool without the handler ever learning that threads exist.
+  handler on a pool without the handler ever learning that threads exist. It does exactly that, in
+  its own closure -- a helper here could not, because publishing what a handler returned is the
+  composition root's job and a generic wrapper would have to discard it.
 
 **It knows nothing about what it carries.** The handler is a coroutine function taking an ``Event``,
 so this class is as useful to Risk as to either producer, and it has no idea which. What it does
@@ -25,7 +27,6 @@ know is the one thing every consumer of a conflating bus has to: that events are
 
 from __future__ import annotations
 
-import asyncio
 from collections.abc import Awaitable, Callable
 
 from volengine.contracts.events import Event
@@ -106,33 +107,3 @@ class BusRunner:
                 self._metrics.counter("runner.handler_failed", subscriber=self._name)
             else:
                 self._metrics.counter("runner.handled", subscriber=self._name)
-
-
-def in_executor(
-    handler: Callable[[Event], object],
-    executor: object | None = None,
-) -> EventHandler:
-    """Adapt a synchronous handler into one a runner can drive, off the event loop.
-
-    ADR-005 in four lines. A calibration or a training step holds the GIL for milliseconds to
-    seconds, and running it inline would stall every other market's ingestion for exactly that
-    long -- so it goes to a named thread pool and the loop awaits the pool rather than the
-    arithmetic.
-
-    Args:
-        handler: The synchronous use case, typically ``some_use_case.handle``. Its return value is
-            **discarded**, which is why the type is ``object``: publishing what a handler produced
-            is the composition root's job and it wires that in the closure it passes here.
-        executor: The pool to run on, or ``None`` for asyncio's default. A named pool per producer
-            is what ADR-005 asks for, and ``platform.executors.NamedExecutors`` supplies them; the
-            default exists so a walking skeleton can run before any of that is wired.
-
-    Returns:
-        A coroutine function suitable for :class:`BusRunner`.
-    """
-
-    async def run(event: Event) -> None:
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(executor, handler, event)  # type: ignore[arg-type]
-
-    return run

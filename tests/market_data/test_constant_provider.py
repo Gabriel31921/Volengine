@@ -282,3 +282,26 @@ def test_a_chain_with_no_strike_or_no_expiry_is_refused() -> None:
         ConstantProvider(make_conventions(), log_moneyness=())
     with pytest.raises(ValueError, match="at least one expiry"):
         ConstantProvider(make_conventions(), tenor_days=())
+
+
+def test_a_tenor_that_has_already_expired_is_refused_at_construction() -> None:
+    """Not emptiness but an element, and the reason the elements are checked at all: a zero tenor
+    is a legal float that escapes mid-stream as ``ExpiredInstrumentError``, blaming the instrument
+    for an argument. The constructor documents a plain ``ValueError``, so it has to raise one."""
+    with pytest.raises(ValueError, match="positive finite number of days"):
+        ConstantProvider(make_conventions(), tenor_days=(0.0,))
+
+
+def test_a_tenor_of_nan_is_refused_rather_than_handed_to_the_calendar() -> None:
+    """``nan > 0`` is ``False``, so this is caught by the ordering half of the guard as much as by
+    ``isfinite`` -- but unguarded it reaches ``int()`` and comes back as the stdlib's "cannot
+    convert float NaN to integer", which names neither the argument nor the provider."""
+    with pytest.raises(ValueError, match="positive finite number of days"):
+        ConstantProvider(make_conventions(), tenor_days=(30.0, float("nan")))
+
+
+def test_a_strike_ladder_carrying_a_nan_is_refused() -> None:
+    """A NaN log-moneyness prices a NaN premium at every expiry, and the whole chain arrives
+    downstream as quotes no constructor rejects one at a time."""
+    with pytest.raises(ValueError, match="log-moneyness must be finite"):
+        ConstantProvider(make_conventions(), log_moneyness=(0.0, float("inf")))

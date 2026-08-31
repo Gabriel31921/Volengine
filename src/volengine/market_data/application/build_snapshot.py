@@ -76,17 +76,6 @@ class BuildSnapshotUseCase:
         self._last_emit: datetime | None = None
         self._sequence = 0
 
-    @property
-    def last_emit(self) -> datetime | None:
-        """When a snapshot last went out, or ``None`` if none ever has.
-
-        Exposed read-only because the heartbeat of ``SnapshotPolicyConfig.max_quiet_seconds`` is
-        evaluated against it, and the pipeline of F1-07 -- which is the only thing that can drive
-        a timer -- needs to know how long this market has been silent without being able to
-        rewrite the answer.
-        """
-        return self._last_emit
-
     def build(self) -> MarketSnapshot | None:
         """Emit a snapshot if the policy says the chain is worth publishing, else ``None``.
 

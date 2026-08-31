@@ -13,6 +13,7 @@ rule is a report count, so every test below runs in milliseconds and always in t
 from __future__ import annotations
 
 import asyncio
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
@@ -69,6 +70,7 @@ def make_pipeline(
     calibrators: dict[str, StubCalibrator] | None = None,
     max_quiet_seconds: float | None = None,
     material_move_threshold: float = 0.0,
+    clock: ManualClock | None = None,
 ) -> tuple[RecordingWriter, RecordingMetrics, Pipeline]:
     """The whole engine on fakes: one market, one book, whatever calibrators were asked for."""
     held: dict[str, StubCalibrator] = (
@@ -89,7 +91,7 @@ def make_pipeline(
     pipeline = build_pipeline(
         config,
         make_adapters(provider, dict(held), writer),
-        ManualClock(NOW),
+        clock if clock is not None else ManualClock(NOW),
         InProcessConflatingBus(metrics),
         metrics,
     )
@@ -539,12 +541,20 @@ async def test_a_run_stops_when_its_duration_elapses() -> None:
     ``BlockingProvider`` never ends its stream, so without the timer this call would not return.
     Time is the ``ManualClock``'s, which advances on ``sleep`` instead of waiting -- the run is
     therefore over in microseconds and the assertion is about the stopping rule, not about speed.
+
+    The clock is what is asserted, and it has to be: returning is not evidence here, because a
+    test whose only failure mode is a hang wedges the gate instead of failing it. That the run
+    ended *because the duration elapsed* -- rather than because the feed dried up or a goal was
+    met -- is visible as exactly thirty seconds of simulated time having passed.
     """
+    clock = ManualClock(NOW)
     _, _, pipeline = make_pipeline(
-        BlockingProvider(updates=two_sided(), instruments=one_instrument())
+        BlockingProvider(updates=two_sided(), instruments=one_instrument()), clock=clock
     )
 
     await pipeline.run(duration_seconds=30.0)
+
+    assert clock.now() - NOW == timedelta(seconds=30)
 
 
 async def test_a_duration_of_zero_is_a_caller_mistake() -> None:

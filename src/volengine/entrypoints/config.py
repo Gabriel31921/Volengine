@@ -672,10 +672,20 @@ def _pair(raw: Mapping[str, Any], key: str, where: str) -> tuple[float, float]:
 
 def _optional_path(raw: Mapping[str, Any], key: str, where: str) -> Path | None:
     """A filesystem path, or ``None`` when the key is absent. Not checked for existence here:
-    whether the path must be writable is the adapter's question, and it answers it by opening."""
+    whether the path must be writable is the adapter's question, and it answers it by opening.
+
+    Emptiness *is* checked here, on the raw string, because it cannot be checked anywhere else:
+    ``Path("")`` is ``PosixPath('.')``, so a blank in the file arrives at ``RiskConfig`` as a
+    perfectly ordinary path to the working directory and gets past its guard. Left to the adapter
+    it would surface as an ``OSError`` naming ``'.'``, which tells an operator nothing about the
+    line they wrote.
+    """
     if key not in raw:
         return None
-    return Path(_text(raw, key, where))
+    text = _text(raw, key, where)
+    if not text.strip():
+        raise ConfigError(f"{where}: {key!r} must not be empty")
+    return Path(text)
 
 
 def _member[E: StrEnum](raw: Mapping[str, Any], key: str, where: str, kind: type[E]) -> E:

@@ -7,7 +7,6 @@ handles, it counts, and it refuses to die on a bad event while still dying on a 
 from __future__ import annotations
 
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 
 import pytest
@@ -16,7 +15,7 @@ from tests.support import RecordingMetrics
 from volengine.contracts.events import ChainCompositionChanged, Event
 from volengine.platform.bus import InProcessConflatingBus
 from volengine.platform.metrics import NullMetricsSink
-from volengine.platform.runner import BusRunner, in_executor
+from volengine.platform.runner import BusRunner
 
 TOPIC = "chain.composition"
 
@@ -131,17 +130,3 @@ def test_an_unnamed_runner_is_refused() -> None:
 
     with pytest.raises(ValueError, match="named"):
         BusRunner(bus.subscribe(TOPIC, "svi"), handler, RecordingMetrics(), "")
-
-
-async def test_a_synchronous_handler_can_be_driven_through_an_executor() -> None:
-    """ADR-005: the loop awaits the pool rather than the arithmetic."""
-    bus = InProcessConflatingBus(NullMetricsSink())
-    subscription = bus.subscribe(TOPIC, "svi")
-    seen: list[Event] = []
-
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        runner = BusRunner(subscription, in_executor(seen.append, pool), RecordingMetrics(), "svi")
-        bus.publish(TOPIC, an_event())
-        await drive(runner, ticks=20)
-
-    assert len(seen) == 1

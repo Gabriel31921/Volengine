@@ -655,8 +655,13 @@ class ScipyCalibrator:
 
     @property
     def settings(self) -> FitSettings:
-        """The knobs this instance was built with. Read-only, and read by the tests that assert
-        what a setting does; nothing in the pipeline needs it."""
+        """The knobs this instance was built with.
+
+        Read-only, and the seam F2-07's wiring tests assert through: that `[calibration.fit]`
+        reached this adapter, and that a file without the table leaves it on its own defaults,
+        are claims about what was constructed and there is no other way to see them from outside.
+        Nothing in the pipeline reads it.
+        """
         return self._settings
 
     def calibrate(

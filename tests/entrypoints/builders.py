@@ -6,9 +6,14 @@ builders import from all of them -- which nothing in ``src/`` may do and ``tests
 ports: ``StubProvider`` from Market Data, ``StubCalibrator`` from Parametric Pricing. Writing a
 second pair here would be two more objects to keep in step with two protocols.
 
-The one fake that is genuinely this package's is :class:`RecordingWriter`: ``ReportWriter`` has no
-implementation anywhere yet -- ``ConsoleReportWriter`` is F1-08 -- and a report that was written
-is the only observable end of the whole pipeline.
+The fakes that are genuinely this package's are the ones whose subject is a *run* rather than a
+port. :class:`RecordingWriter` holds the reports, which is the observable end of the whole
+pipeline. :class:`SlowCalibrator` and :class:`FlakyCalibrator` are the two ways a producer misses
+its cycle -- too slow, and refusing outright -- and both take a ``StubCalibrator`` and add one
+behaviour to it rather than restating the port. :class:`RecordingCalibrator` wraps a *real*
+calibrator to keep what it was asked and what it answered, which is the only way to assert on
+parameters a published surface no longer carries (ADR-001). :class:`RecordingBus` keeps the whole
+event history, because a conflating mailbox shows a subscriber only what it kept up with.
 """
 
 from __future__ import annotations
@@ -21,6 +26,7 @@ from time import sleep as thread_sleep
 
 from tests.market_data.builders import FORWARD, NEAR, NOW, make_instrument, make_update
 from tests.parametric_pricing.builders import StubCalibrator, make_grid_spec, make_weighting
+from volengine.contracts.events import Event
 from volengine.entrypoints.config import (
     AppConfig,
     CalibrationConfig,
@@ -43,8 +49,11 @@ from volengine.market_data.domain.snapshot_policy import SnapshotPolicyConfig
 from volengine.parametric_pricing.adapters.scipy_calibrator import FitSettings
 from volengine.parametric_pricing.application.calibrate_on_snapshot import Acceptance
 from volengine.parametric_pricing.domain.calibration import CalibrationResult, CalibrationTask
+from volengine.parametric_pricing.domain.errors import CalibrationError
 from volengine.parametric_pricing.domain.ports import Calibrator
 from volengine.parametric_pricing.domain.svi_slice import SVIParams
+from volengine.platform.bus import InProcessConflatingBus, Subscription
+from volengine.platform.metrics import MetricsSink
 from volengine.risk.application.compute_report import ReportSettings
 from volengine.risk.domain.freshness_policy import FreshnessPolicy
 from volengine.risk.domain.portfolio import Portfolio, Position
@@ -98,6 +107,7 @@ def make_market_config(
     max_quiet_seconds: float | None = None,
     underlying: str = UNDERLYING,
     synthetic: SyntheticSettings | None = None,
+    min_coverage_ratio: float = 0.0,
 ) -> MarketConfig:
     """One market whose policy publishes on every cadence tick and never marks anything degraded.
 
@@ -125,7 +135,7 @@ def make_market_config(
         snapshot=SnapshotPolicyConfig(
             cadence_seconds=cadence_seconds,
             material_move_threshold=material_move_threshold,
-            min_coverage_ratio=0.0,
+            min_coverage_ratio=min_coverage_ratio,
             max_quiet_seconds=max_quiet_seconds,
         ),
         provider=provider,
@@ -164,13 +174,18 @@ def make_risk_config(
     writer: str = WRITER_NAME,
     positions: tuple[Position, ...] | None = None,
     output_path: Path | None = None,
+    freshness: FreshnessPolicy | None = None,
 ) -> RiskConfig:
     """One at-the-money call on the near expiry, valued under a policy nothing here trips."""
     return RiskConfig(
         portfolio=Portfolio(
             positions=(make_position(),) if positions is None else positions,
         ),
-        freshness=FreshnessPolicy(warn_seconds=30.0, reject_seconds=120.0),
+        freshness=(
+            FreshnessPolicy(warn_seconds=30.0, reject_seconds=120.0)
+            if freshness is None
+            else freshness
+        ),
         settings=ReportSettings(bumps=BumpSpec(forward_rel=0.01, vol_abs=0.01)),
         writer=writer,
         output_path=output_path,
@@ -215,6 +230,89 @@ class SlowCalibrator(StubCalibrator):
     ) -> CalibrationResult:
         thread_sleep(self._seconds)
         return super().calibrate(previous, task)
+
+
+class FlakyCalibrator(StubCalibrator):
+    """A ``StubCalibrator`` that fits a few cycles and then refuses every one after them.
+
+    The shape ADR-006 is written about, and the only shape in which a stale republish can be
+    observed end to end: a producer with nothing behind it publishes a bare ``CalibrationFailed``,
+    so a calibrator that failed from the first cycle would exercise the *other* branch. The good
+    cycles have to come first, and they have to come from the same object, because what is
+    republished is the state this instance accumulated.
+    """
+
+    def __init__(self, good_cycles: int = 1, producer_id: str = CALIBRATOR_NAME) -> None:
+        super().__init__(producer_id=producer_id)
+        self._good_cycles = good_cycles
+        self.refusals = 0
+
+    def calibrate(
+        self,
+        previous: Mapping[datetime, SVIParams] | None,
+        task: CalibrationTask,
+    ) -> CalibrationResult:
+        if len(self.calls) >= self._good_cycles:
+            self.calls.append(previous)
+            self.refusals += 1
+            raise CalibrationError("the optimiser did not converge on this snapshot")
+        return super().calibrate(previous, task)
+
+
+class RecordingCalibrator:
+    """A ``Calibrator`` that keeps what a real one was asked and what it answered.
+
+    The one way to assert a known-truth recovery *through the engine*. ``CalibratedSurface``
+    publishes a table of volatilities and no parameters (ADR-001), so by the time a fit reaches a
+    report the five numbers a generator was configured with have been evaluated away. This sits
+    where they still exist -- between the ACL that built the task and the ACL that publishes the
+    answer -- and delegates everything else to the calibrator it wraps.
+    """
+
+    def __init__(self, inner: Calibrator) -> None:
+        self._inner = inner
+        self.tasks: list[CalibrationTask] = []
+        self.results: list[CalibrationResult] = []
+
+    @property
+    def producer_id(self) -> str:
+        return self._inner.producer_id
+
+    def calibrate(
+        self,
+        previous: Mapping[datetime, SVIParams] | None,
+        task: CalibrationTask,
+    ) -> CalibrationResult:
+        result = self._inner.calibrate(previous, task)
+        self.tasks.append(task)
+        self.results.append(result)
+        return result
+
+
+class RecordingBus:
+    """An ``EventBus`` that keeps the whole history it carried, then delivers it as usual.
+
+    Conflation is the reason this exists. A subscriber sees only what it managed to keep up with,
+    so a test that wants to know what the engine *published* -- how many snapshots went out, which
+    of them a slow consumer ever saw, what status a surface carried -- cannot learn it from a
+    mailbox. Delegation rather than a subclass: the bus under test stays the real one, and this
+    object satisfies the same protocol structurally.
+    """
+
+    def __init__(self, metrics: MetricsSink) -> None:
+        self._inner = InProcessConflatingBus(metrics)
+        self.carried: list[tuple[str, Event]] = []
+
+    def subscribe(self, topic: str, subscriber: str) -> Subscription:
+        return self._inner.subscribe(topic, subscriber)
+
+    def publish(self, topic: str, event: Event) -> None:
+        self.carried.append((topic, event))
+        self._inner.publish(topic, event)
+
+    def events_of[E: Event](self, kind: type[E]) -> list[E]:
+        """Every event of one type, in publication order."""
+        return [event for _, event in self.carried if isinstance(event, kind)]
 
 
 class RecordingWriter:

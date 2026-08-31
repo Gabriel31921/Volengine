@@ -89,6 +89,15 @@ close naturally in a later phase.
   reproducible from a file without any factory learning about the engine's clock. What is still
   not reproducible from a file is a whole *run* under a `ManualClock` — the feed's timeline and
   the engine's clock are two sources, and only the first one is in the TOML.
+- **A `ManualClock` run is reproducible only while nothing advances it.** F2-08 pins both sources
+  from the test and gets a byte-identical report out of two runs
+  (`tests/entrypoints/test_determinism.py`), and it does so on a clock that never moves: with no
+  heartbeat, the cadence is met once, and the session is one snapshot, one fit, one report
+  whatever the thread pool does. Configure `max_quiet_seconds` and the heartbeat becomes the
+  thing moving time, turning as fast as the event loop lets it — so *how much* simulated time has
+  passed when a fit comes back off its pool is a scheduling detail. No test may assert on it, and
+  `tests/entrypoints/test_degradation.py` deliberately asserts only what grows more true with
+  time. Closing this needs F3-B's `SimulatedClock`, where the recording says when to move.
 - **A provider's settings are a named field, one per adapter.** `MarketConfig.synthetic` names the
   one adapter it configures, and a second provider with settings gets a second field rather than a
   shared untyped bag. That keeps every value validated where the error can name its table, and it

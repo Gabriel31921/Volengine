@@ -37,15 +37,16 @@ in the current state.
 | [026](0026-raw-svi-closed-form-lives-in-the-shared-kernel.md) | The raw SVI closed form lives in the shared kernel | Accepted |
 | [027](0027-scipy-calibrator-departures-of-f2-05.md) | `ScipyCalibrator`'s departures from the plan in F2-05 | Accepted |
 | [028](0028-composition-root-departures-of-f2-07.md) | Composition-root departures of F2-07 | Accepted |
+| [029](0029-jax-calibrator-departures-of-f3-a.md) | `JaxCalibrator`'s departures from the plan in F3-A | Accepted |
 
 ADR-001 to ADR-010 are extracted from the design document. ADR-011 onward were taken during
 implementation and exist only here.
 
-ADR-020, ADR-021, ADR-022, ADR-023, ADR-025, ADR-027 and ADR-028 are the one departure from "one
-file, one decision": each collects the small API decisions of a build phase — the domain layer, the
-ACLs and use cases, the composition root, the walking skeleton, the synthetic feed, the first real
-calibrator, the wiring of F2 — which are individually too slight for a record of their own and
-collectively too load-bearing to lose. Every item in them
+ADR-020, ADR-021, ADR-022, ADR-023, ADR-025, ADR-027, ADR-028 and ADR-029 are the one departure
+from "one file, one decision": each collects the small API decisions of a build phase — the domain
+layer, the ACLs and use cases, the composition root, the walking skeleton, the synthetic feed, the
+first real calibrator, the wiring of F2, the JAX calibrator — which are individually too slight for
+a record of their own and collectively too load-bearing to lose. Every item in them
 is also stated in the docstring of the module that owns it. They are written once, when that phase
 is built, and never appended to afterwards: a later phase's departures get a later record, because
 these files are immutable like every other one.

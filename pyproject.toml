@@ -65,6 +65,13 @@ mypy_path = "src"
 module = ["scipy.*"]
 ignore_missing_imports = true
 
+# `optax` ships no `py.typed`, and neither `jax` nor `optax` is installed on the CI leg that syncs
+# the dev group alone (ADR-024) -- the adapters that import them are an optional extra. One entry
+# naming the unchecked libraries, for the same reason the scipy one exists above.
+[[tool.mypy.overrides]]
+module = ["jax.*", "optax.*"]
+ignore_missing_imports = true
+
 [[tool.mypy.overrides]]
 module = [
     "volengine.contracts.*",

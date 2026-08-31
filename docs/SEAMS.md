@@ -33,6 +33,27 @@ close naturally in a later phase.
 - **`test_durrleman.py` imports the private `_curve_and_derivatives`**, with no precedent in the
   repo. A sign slip in `w'` still yields a plausible `g`, so the derivative has to be pinned against
   an independent computation rather than only through the function that consumes it.
+- **The padded reservation cannot grow while the engine runs** (ADR-009). `PadShape` *is* the
+  compiled signature, so widening it is a new compilation and therefore a restart. A task with more
+  expiries or more strikes than reserved is refused by `adapters/padding.pad` with a
+  `CalibrationError` naming the number it would need, and the use case republishes the last good
+  surface. Handling `ChainCompositionChanged` so the reservation follows a growing chain is F3-C's,
+  which is where that event is first produced.
+- **The JAX cold cycle is "after a failure" and never "periodic".** Design 5.6 asks for both, and a
+  `Calibrator` reads no clock and keeps no state (the port forbids it), so a pure function cannot
+  know that an interval has elapsed. The half that is expressible is implemented: a warm start that
+  comes back unconverged or pinned is retried from the multi-start. The periodic half belongs to
+  the use case that owns `CalibrationState`, and nothing there schedules it yet.
+- **The JAX calibrator has no TOML home and is not in `default_adapters`.** `JaxFitSettings` and
+  `PadShape` are constructor arguments with working defaults, and `svi-jax` is reachable from
+  Python and from the contract harness but not from a configuration file. Wiring it means a factory
+  that imports an optional extra lazily and a settings section beside `[calibration.fit]`; F3-A
+  stayed inside the two modules `Implementation.md` names for it. Until then a deployment runs the
+  scipy baseline.
+- **`adapters/jax_greeks.py` has no consumer in the engine, deliberately.** Greeks do not travel in
+  the contract (ADR-001, Design 2.2) and Risk computes its own by bumping (Design 7.4), so the AD
+  greeks of Design 5.8 are a module an analyst calls and the pipeline does not. Nothing imports it,
+  and that is the correct amount rather than an oversight.
 
 ## Neural Surface
 
@@ -134,5 +155,7 @@ close naturally in a later phase.
 - **The library bans are deny lists, not allow lists.** Rules 1, 2, 3 and 7 are `forbidden`
   contracts naming `jax`, `torch`, `scipy` and `numpy`, so they catch the dependencies the design
   argued about and would not notice a brand-new third-party import appearing in the domain.
-- **The vectorised JAX Black-76 of F3-A cannot live in the shared kernel** (rule 1, ADR-011). It is
-  a genuine reimplementation and will be tested against the kernel as its oracle.
+- **The vectorised JAX Black-76 cannot live in the shared kernel** (rule 1, ADR-011). It is a
+  genuine reimplementation -- batched and differentiable -- and has lived in
+  `parametric_pricing/adapters/jax_black76.py` since F3-A, tested against the kernel as its oracle,
+  deep wing included. The duplication itself stands and is the only copy of the formula left.

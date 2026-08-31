@@ -16,13 +16,16 @@ tests carry it all the way through Risk -- the executable equivalent of the cont
 
 **Adding F3's calibrators is meant to be one line**: an entry in :data:`CALIBRATORS`. If a new
 implementer needs a test body changed to pass, the port has grown a second meaning and that is the
-finding, not the failure.
+finding, not the failure. F3-A's JAX calibrator joined exactly that way, and the only thing that
+was not one line is that it arrives with an optional extra -- so the entry is conditional and the
+set is one shorter on a machine that installed no JAX.
 """
 
 from __future__ import annotations
 
 import math
 from collections.abc import Callable
+from importlib.util import find_spec
 
 import pytest
 
@@ -47,13 +50,29 @@ from volengine.risk.domain.valuation import position_risk
 
 pytestmark = pytest.mark.contract
 
-CALIBRATORS: tuple[Callable[[], Calibrator], ...] = (ScipyCalibrator, FlatVolCalibrator)
+
+def _implementers() -> tuple[Callable[[], Calibrator], ...]:
+    """Every implementer of the port this *installation* can construct.
+
+    The JAX one is imported inside the guard rather than at module level because ``jax`` is an
+    optional extra (ADR-024) and this module has to keep running without it -- it is the one test
+    that must not be skipped when a calibrator is missing, since "how many producers are there"
+    is part of what it asserts.
+    """
+    if find_spec("jax") is None:
+        return (ScipyCalibrator, FlatVolCalibrator)
+    from tests.parametric_pricing.jax_builders import make_jax_calibrator
+
+    return (ScipyCalibrator, FlatVolCalibrator, make_jax_calibrator)
+
+
+CALIBRATORS: tuple[Callable[[], Calibrator], ...] = _implementers()
 """Every implementer of the port this build can construct, as zero-argument factories.
 
-Two today, three when F3-A lands its JAX calibrator and F3-D its learner. A factory rather than an
-instance so that each test gets a calibrator that has never been called: warm-start state is the
-one thing a calibrator is allowed to keep between cycles, and a shared instance would let one
-test's history decide another test's answer.
+Three with the JAX extra installed, two without, and one more when F3-D lands its learner. A
+factory rather than an instance so that each test gets a calibrator that has never been called:
+warm-start state is the one thing a calibrator is allowed to keep between cycles, and a shared
+instance would let one test's history decide another test's answer.
 """
 
 IDS = tuple(factory.__name__ for factory in CALIBRATORS)

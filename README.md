@@ -58,8 +58,18 @@ uv run volengine report --config examples/walking-skeleton.toml --count 2
 ```
 
 It prints risk reports carrying back the volatility the feed was priced at, across all three
-wired contexts. `volengine run` drives the same graph without a stopping rule; `record` and
-`replay` refuse with exit 1 until F3-B.
+wired contexts. `volengine run` drives the same graph without a stopping rule, and since F3-B
+`record` and `replay` drive it too:
+
+```bash
+uv run volengine record --config examples/walking-skeleton.toml --recording session.jsonl
+uv run volengine replay --config examples/walking-skeleton.toml --recording session.jsonl
+```
+
+`record` is an ordinary session with a tap on it, writing the normalised quote stream to JSON
+Lines; `replay` runs the whole engine off that file alone, on a clock the recording moves. Two
+replays of one recording write the same report byte for byte, which is what ADR-004 asked for —
+with the one caveat about conflation on longer sessions that `docs/SEAMS.md` records.
 
 The adapters behind it are deliberately trivial — a constant chain, a flat-volatility calibrator,
 a console writer — because their job is to prove the graph, not the mathematics. The second shipped

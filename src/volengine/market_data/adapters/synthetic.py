@@ -54,6 +54,14 @@ adapter generates is what the calibrator is *measured against*, so two copies of
 would be one sign slip away from cancelling on both sides and passing the known-truth test with
 the engine wrong -- which is the trap this stage was warned about.
 
+**The surface is SVI by default and need not be.** Since F3-B the generator is reached through
+:class:`VolatilitySpec` -- one method, ``volatility(k, tenor_years)`` -- so a slice of
+``adapters/heston.py`` sits in ``true_params`` exactly where an ``SVIParamsSpec`` does, and this
+module never learns which it is quoting. Everything the feed adds on top of a generated surface
+(the noise, the spread, the sizes, the stamps, the junk) is generator-agnostic and stays written
+once. The two are related the way a pair of adapters behind one port are: structurally, with no
+import in either direction.
+
 **Nothing here is a threshold** in the sense ADR-012 governs. Cadence, admissibility and
 acceptance are judgements the engine makes about a market and live in TOML; these are the
 properties of an invented market, and the fixture that invents it is the right place for them.
@@ -69,7 +77,7 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from types import MappingProxyType
-from typing import assert_never
+from typing import Protocol, assert_never
 
 from volengine.market_data.domain.admissibility import BASIS_POINTS_PER_UNIT
 from volengine.market_data.domain.market_conventions import MarketConventions
@@ -82,6 +90,34 @@ from volengine.market_data.domain.option_quote import (
 from volengine.shared_kernel.domain import svi
 from volengine.shared_kernel.domain.black76 import price
 from volengine.shared_kernel.domain.instants import require_aware
+
+
+class VolatilitySpec(Protocol):
+    """What this feed needs from a generator: the volatility it quotes at a moneyness and a tenor.
+
+    One method, because one method is all the provider ever calls. Everything else about a
+    generating model -- how many parameters it has, whether its slices are independent, whether it
+    has a term structure at all -- is the model's own business, and a port that asked for more
+    would be a port only SVI could satisfy.
+
+    A ``Protocol``, so conformance is structural and nothing has to inherit: ``SVIParamsSpec``
+    below and ``adapters/heston.HestonParamsSpec`` beside it both fit, and neither module imports
+    the other. That is the same arrangement ``MarketDataProvider`` has with this file, one level
+    down, and it is what makes a third generator a new module rather than an edit here.
+
+    Not a domain port and deliberately not in ``domain/ports.py``: the domain has no opinion about
+    how an invented market is invented, and would refuse to grow one.
+    """
+
+    def volatility(self, k: float, tenor_years: float) -> float:
+        """Annualised Black-76 volatility at log-forward-moneyness ``k`` and that tenor.
+
+        Raises:
+            ValueError: If the tenor is not positive and finite. There is no volatility to imply
+                over an interval of no length, and returning an ``inf`` would only move the
+                failure into a constructor further downstream.
+        """
+        ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -352,10 +388,17 @@ class SyntheticConfig:
     quote drift as the forward walks, which is the drift a calibrator has to track.
     """
 
-    true_params: Mapping[timedelta, SVIParamsSpec] = field(
+    true_params: Mapping[timedelta, VolatilitySpec] = field(
         default_factory=lambda: DEFAULT_TRUE_PARAMS
     )
-    """The generating surface, one slice per expiry. The answer a fit is checked against."""
+    """The generating surface, one slice per expiry. The answer a fit is checked against.
+
+    Typed as :class:`VolatilitySpec` rather than as ``SVIParamsSpec`` since F3-B, which is what
+    lets ``adapters/heston.py`` be quoted through this feed without either module importing the
+    other. The same object may legitimately stand against every expiry -- that is exactly what a
+    stochastic-volatility model is, one process generating the whole term structure -- and the
+    invariant below is unchanged by it: every expiry still needs exactly one generator.
+    """
 
     spread_bp: float = DEFAULT_SPREAD_BP
     """Typical full spread, in basis points of the mid premium."""
@@ -437,7 +480,7 @@ class _Slice:
     """One expiry of the built chain: when it expires, what it is worth, and at which strikes."""
 
     instant: datetime
-    params: SVIParamsSpec
+    params: VolatilitySpec
     strikes: tuple[float, ...]
 
 

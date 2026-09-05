@@ -15,6 +15,30 @@ close naturally in a later phase.
 - **`IV_DIVERGENCE` never fires.** `flag_quote` receives `own_iv=None` from the chain, and will
   until Market Data grows its own mid inversion in F2 — a wrapper over the shared kernel since
   ADR-014.
+- **A recording holds the normalised stream, not the venue's bytes.** `RecordingProvider` taps
+  `QuoteUpdate`s, so everything upstream of the port — the symbol grammar, the expiry resolution,
+  the numeraire decision — is *inside* the recording rather than reproduced from it, and no replay
+  exercises the parser its file came from. Deliberate, and it is what lets one recorder serve every
+  provider: recording frames instead would mean one recorder per venue and a replay re-running the
+  code most likely to have changed since. It does mean F3-C's golden fixture proves the engine and
+  not the Deribit grammar; a second sink beside this one is what would close it.
+- **`RecordingSink` writes and flushes on the event loop, one line per quote.** That is what makes
+  a session killed by a signal replayable up to the line it died on, and it is blocking file I/O in
+  the middle of ingestion: an hour of Deribit is millions of lines, and the flush is the first thing
+  to reconsider when the recorder is measured against a real feed. Buffering, or a writer task
+  behind a queue, both cost the property the flush buys.
+- **The Heston generator resolves a premium only to about 1e-11 of the forward.** The Lewis
+  integral is accurate in *absolute* terms, so a deep out-of-the-money option at a short tenor —
+  a one-week strike a quarter of the way out is worth around 1e-11 — comes back as the quadrature's
+  own rounding, occasionally negative. `heston.PRICE_RESOLUTION` refuses to invert below that
+  rather than quote a volatility with no digits in it, which turns the wing into a loud failure
+  and not a silent one. Closing it means a different formulation for the wings (a control variate
+  against Black-76 was tried and does not help at a realistic vol of vol), not a smaller tolerance.
+- **The Heston generator has no TOML home.** `[[market.synthetic.slice]]` builds `SVIParamsSpec`,
+  so a Heston market is reachable from Python and from the tests and not from a configuration
+  file. Wiring it needs a table of its own and a rule for which of the two generators a file may
+  name — a question F3-B did not have to answer, because the deliverable was a second generator
+  and not a second way to configure one.
 
 ## Parametric Pricing
 
@@ -105,7 +129,8 @@ close naturally in a later phase.
   clock instead. Harmless here — a venue stamps its own messages and `max_skew_seconds`
   reconciles them — and it stays harmless as long as the deterministic replay of ADR-004 arrives
   as `RecordedProvider` in F3-B, replaying recorded instants rather than asking a synthetic feed
-  to read a different clock. F2-07 took the second of the two answers this seam offered for the
+  to read a different clock. That is how it arrived: `pipeline.with_replay` hands the clock to the
+  one adapter whose job is to move it, through a closure, and `ProviderFactory` is unchanged. F2-07 took the second of the two answers this seam offered for the
   synthetic feed: `[market.synthetic]` carries the seed *and* a `start`, so the stream is
   reproducible from a file without any factory learning about the engine's clock. What is still
   not reproducible from a file is a whole *run* under a `ManualClock` — the feed's timeline and
@@ -118,7 +143,27 @@ close naturally in a later phase.
   thing moving time, turning as fast as the event loop lets it — so *how much* simulated time has
   passed when a fit comes back off its pool is a scheduling detail. No test may assert on it, and
   `tests/entrypoints/test_degradation.py` deliberately asserts only what grows more true with
-  time. Closing this needs F3-B's `SimulatedClock`, where the recording says when to move.
+  time. **F3-B closes the half of this that a file can close**: `volengine replay` puts both
+  sources in the recording — the quotes and the instants the engine read them at — so two replays
+  of one file write the same bytes with nothing pinned from a test
+  (`tests/entrypoints/test_replay.py`). What stays open is the *live* run: a `SystemClock` session
+  is reproducible only by recording it first, and a `ManualClock` one only by a test holding both
+  ends, because a TOML file still has no way to name the engine's clock. **And conflation is
+  reproduced rather than removed**: a replay delivers its quotes as fast as the consumer takes
+  them, so a snapshot published while the previous fit is still on its pool is overwritten in a
+  one-slot mailbox (ADR-003), and how many reports a long recording produces is still a function
+  of how fast the machine fits. The test above is byte-exact because its session is one snapshot,
+  one fit, one report — the same construction `test_determinism.py` relies on. Closing it for a
+  long recording means a replay that awaits each handler before pulling the next quote, which is a
+  second path through `Pipeline` and would no longer be reproducing the engine that ran.
+- **A replay runs without the heartbeat, and `cli._without_heartbeat` is where that is decided.**
+  Under a `SimulatedClock` nothing but the recording moves time, so the timer racing the stream
+  either never fires or spins — and whether it fired at all would depend on how the event loop
+  interleaved two tasks, which is the non-determinism the command exists to remove. The cost is
+  real and unmeasured: the snapshots the heartbeat emitted during the original session are not
+  reproduced by its replay, so a recording of a market that went quiet replays as a shorter
+  sequence of snapshots than it produced. Closing it means recording the heartbeat's own occasions
+  as events in the file, which is a second line kind and a second thing to keep in step.
 - **A provider's settings are a named field, one per adapter.** `MarketConfig.synthetic` names the
   one adapter it configures, and a second provider with settings gets a second field rather than a
   shared untyped bag. That keeps every value validated where the error can name its table, and it

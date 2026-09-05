@@ -16,6 +16,7 @@ import pytest
 
 from tests.entrypoints.builders import CONFIG_TOML, replacing, without, write_config
 from volengine.entrypoints.config import AppConfig, ConfigError, load_config
+from volengine.market_data.adapters.synthetic import SVIParamsSpec
 from volengine.market_data.domain.market_conventions import DayCount, ForwardMethod, Numeraire
 from volengine.risk.domain.pricing import OptionKindR
 
@@ -257,7 +258,12 @@ def test_the_slices_become_the_expiries_and_the_parameters_at_once(tmp_path: Pat
     assert settings is not None
     assert settings.config.expiries == (timedelta(days=30), timedelta(days=90))
     assert set(settings.config.true_params) == set(settings.config.expiries)
-    assert settings.config.true_params[timedelta(days=90)].sigma == 0.25
+    # `true_params` is typed as the generator protocol since F3-B, so that a Heston market can sit
+    # in the same field. What a *file* builds is still an SVI slice, and the `isinstance` says so
+    # before reading a parameter only that spelling has.
+    generated = settings.config.true_params[timedelta(days=90)]
+    assert isinstance(generated, SVIParamsSpec)
+    assert generated.sigma == 0.25
 
 
 def test_a_market_with_no_synthetic_table_carries_none(tmp_path: Path) -> None:

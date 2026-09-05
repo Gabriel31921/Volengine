@@ -31,6 +31,13 @@ console or a file. A name it does not hold fails here with a message that says w
 registered. Passing the registry into :func:`build_pipeline` rather than reaching for it keeps the
 graph testable with fakes.
 
+**Recording and replay are modes of a run, not entries in that registry** (ADR-004).
+:func:`with_recording` decorates every provider with a tap onto a file; :func:`with_replay`
+replaces every provider with the file itself and hands it the engine's clock. Both take a registry
+and return a registry, so the graph below is built once and does not know which mode it is in --
+which is the point, because a replay that took a different path through this module would be
+reproducing that path rather than the session.
+
 ``entrypoints/config.py`` also imports from two ``*/adapters/`` modules since F2-07 (ADR-028,
 superseding one sentence of ADR-022), for the types ``SyntheticConfig`` and ``FitSettings`` and
 nothing else: their fields are thresholds a
@@ -64,7 +71,8 @@ import asyncio
 import math
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Executor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from pathlib import Path
 
 from volengine.contracts.events import (
     CalibrationFailed,
@@ -82,6 +90,8 @@ from volengine.entrypoints.config import (
     RiskConfig,
 )
 from volengine.market_data.adapters.constant import ConstantProvider
+from volengine.market_data.adapters.recorded import RecordedProvider, Recording, ReplayClock
+from volengine.market_data.adapters.recorder import RecordingProvider, RecordingSink
 from volengine.market_data.adapters.synthetic import SyntheticProvider
 from volengine.market_data.application.acl import to_snapshot_ready
 from volengine.market_data.application.build_snapshot import BuildSnapshotUseCase
@@ -220,6 +230,90 @@ def _csv_report_writer(risk: RiskConfig) -> ReportWriter:
     except OSError as failure:
         message = f"risk: cannot write reports to {risk.output_path} ({failure})"
         raise ConfigError(message) from failure
+
+
+# --- the two modes of ADR-004
+
+
+def with_recording(adapters: Adapters, path: Path) -> Adapters:
+    """The same registry, with every provider wrapped so the session is written to disk.
+
+    **Recording is a mode of a run, not a provider a file can name**, and this is where that is
+    decided. The alternative -- a ``provider = "recording"`` entry pointing at a wrapper, with the
+    real feed named in a sub-table -- would let a configuration file describe a market in two
+    places and would make "record the Deribit feed" a different market from "run the Deribit feed".
+    Here the file describes one market, and the *command* decides whether a tap is fitted to it.
+
+    Every name in the registry is wrapped, including the ones a given file does not use: which
+    provider the tap ends up on is decided by the same lookup as always, so nothing here has to
+    know which one the configuration named.
+
+    Args:
+        adapters: The registry to decorate, normally :func:`default_adapters`.
+        path: The file the session is written to. Opened when the provider is built, which is
+            during :func:`build_pipeline` and therefore before a single quote arrives.
+
+    Returns:
+        A registry whose providers record. The calibrators and writers are untouched.
+    """
+    return replace(
+        adapters,
+        providers={
+            name: _recording_factory(factory, path) for name, factory in adapters.providers.items()
+        },
+    )
+
+
+def _recording_factory(inner: ProviderFactory, path: Path) -> ProviderFactory:
+    """One provider factory, wrapped in the tap, with the file's failure translated.
+
+    An ``OSError`` here is a directory that does not exist or cannot be written to -- the operator's
+    mistake, not the engine's -- so it leaves as a ``ConfigError`` naming the path, exactly like
+    the CSV writer's does.
+    """
+
+    def build(market: MarketConfig) -> MarketDataProvider:
+        try:
+            sink = RecordingSink(path)
+        except OSError as failure:
+            raise ConfigError(f"cannot record to {path} ({failure})") from failure
+        return RecordingProvider(
+            inner=inner(market),
+            sink=sink,
+            market_id=market.market_id,
+            underlying=market.underlying,
+        )
+
+    return build
+
+
+def with_replay(adapters: Adapters, recording: Recording, clock: ReplayClock) -> Adapters:
+    """The same registry, with every provider replaced by the recording.
+
+    Under a replay the configured provider is not built at all: there is no venue to connect to and
+    no synthetic market to invent, only a file. The registry is still consulted by name, so a
+    configuration naming an adapter nobody registered is refused exactly as ``run`` would refuse it
+    -- a replay is run against a file that must describe a runnable engine, and quietly accepting a
+    name that does not exist would hide the day the recording and the configuration parted company.
+
+    The clock is where determinism comes from. It is the engine's own, and this is the one place it
+    is handed to an adapter: ``ProviderFactory`` takes a ``MarketConfig`` and nothing else
+    (ADR-022), so the clock arrives through the closure rather than through the signature, and only
+    for the one adapter whose whole job is to move it.
+
+    Args:
+        adapters: The registry to replace the providers of.
+        recording: The opened session, from ``adapters.recorded.open_recording``.
+        clock: The clock the recorded instants are written into, normally a ``SimulatedClock``
+            already placed at ``recording.started_at``.
+    """
+    return replace(
+        adapters,
+        providers={
+            name: (lambda _market: RecordedProvider(recording, clock))
+            for name in adapters.providers
+        },
+    )
 
 
 # --- routing

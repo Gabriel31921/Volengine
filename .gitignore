@@ -13,6 +13,8 @@ wheels/
 scripts/*
 !scripts/verify.sh
 
+.coverage
+
 # Virtual environments
 .venv
 

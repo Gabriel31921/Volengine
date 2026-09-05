@@ -30,10 +30,13 @@ jobs:
           enable-cache: true
 
       # Installs the Python pinned by requires-python and the locked dependencies.
-      # pdoc imports the package to read its docstrings, so numpy, scipy and typer
-      # have to be present; jax and torch are optional extras and stay out.
+      # pdoc imports the package to read its docstrings, so every module that is
+      # imported unconditionally needs its dependency present. The jax extra is one
+      # of those: parametric_pricing/adapters/jax_*.py import jax at module level,
+      # so it has to be installed here even though it stays an optional extra for
+      # a normal install. torch stays out until an adapter actually imports it.
       - name: Sync the environment
-        run: uv sync --frozen
+        run: uv sync --frozen --extra jax
 
       - name: Build the docs
         run: >

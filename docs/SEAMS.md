@@ -63,6 +63,20 @@ close naturally in a later phase.
   `CalibrationError` naming the number it would need, and the use case republishes the last good
   surface. Handling `ChainCompositionChanged` so the reservation follows a growing chain is F3-C's,
   which is where that event is first produced.
+- **A fit is not bit-stable across two padded reservations.** The searches run inside a `vmap` over
+  the rows, and XLA vectorises each row's own reduction across that batch axis — so how many rows
+  were reserved decides how a row's thirty-two-lane sum is associated, and float32 addition is not
+  associative. The same slice at the same point answers with different bits under two reservations;
+  deep in a fit, where the cost is a cancelling sum, the trajectories part and the evaluation counts
+  land a couple of percent apart. Which reservations agree is a fact about the host and not about
+  this code: capped at SSE4.2 every height agrees bit for bit, under AVX2 one row already disagrees
+  with two, and the AVX-512 runner that first caught this draws the line between four and twelve.
+  Nothing downstream depends on the identity — `n_iterations` is a cost report, and the two fits
+  agree to a thousandth of their own parameters — so
+  `test_the_iteration_count_does_not_grow_with_the_reservation` states the property with a
+  tolerance, and the exclusion of the reserved rows is asserted exactly on one reservation instead.
+  Closing it means giving up single precision or fixing the reduction order, and both cost more
+  than the identity is worth.
 - **The JAX cold cycle is "after a failure" and never "periodic".** Design 5.6 asks for both, and a
   `Calibrator` reads no clock and keeps no state (the port forbids it), so a pure function cannot
   know that an interval has elapsed. The half that is expressible is implemented: a warm start that

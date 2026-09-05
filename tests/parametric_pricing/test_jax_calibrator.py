@@ -46,6 +46,7 @@ from volengine.parametric_pricing.adapters.jax_calibrator import (
     JaxFitSettings,
     _adam_fit,
     _at_bound,
+    _compiled,
     _durrleman_g,
     _lbfgs_fit,
     _objective,
@@ -715,16 +716,25 @@ def test_the_iteration_count_is_objective_evaluations_and_is_never_zero() -> Non
     assert result.n_iterations > 0
 
 
-def test_the_iteration_count_ignores_the_reserved_rows() -> None:
+def test_the_iteration_count_does_not_grow_with_the_reservation() -> None:
     """A padded lane's search is an artefact of the fixed shape. Charging the caller for it would
     make the reported cost depend on how much margin the grid was given rather than on the market.
+    Three times the rows, the same one real slice, and what the caller is charged stays put.
 
-    Three times the rows, the same task, the same quotes per row -- so the arithmetic of the one
-    real slice is bit-identical and the only difference is eight expiries that do not exist. The
-    claim is about the *rows*, deliberately: widening the quote axis changes the length of the
-    masked reductions inside a slice, and a float32 sum over thirty-two lanes is not bit-identical
-    to the same sum over sixty-four, so the search drifts by a step or two. That is precision, not
-    bookkeeping, and it is not what this property is about.
+    **A tolerance and not an equality**, and the reason is a property of the platform rather than
+    of this adapter. The searches run inside a ``vmap`` over the rows, and XLA vectorises a row's
+    own reduction across that batch axis -- so how many rows were reserved decides how that row's
+    thirty-two-lane sum is associated, and float32 addition is not associative. The same slice at
+    the same point comes back with different bits under two reservations, the two searches part
+    company after some thirty L-BFGS iterations, and the counts settle a couple of percent apart.
+    Which reservations agree is a fact about the host's vector width, not about this code: capped
+    at SSE4.2 every height agrees bit for bit, and under AVX2 one row already disagrees with two.
+    The seam is in ``docs/SEAMS.md``.
+
+    The tolerance is wide next to that drift and narrow next to the bug it exists to catch: the
+    reserved rows are worth hundreds of evaluations, so a count that included them would read 1046
+    against 2278 for this pair -- more than double, where ten percent is the gate. What the
+    exclusion is asserted *exactly* against is the test below.
     """
     task = one_slice(svi_task())
     narrow = make_jax_calibrator().calibrate(None, task)
@@ -733,8 +743,36 @@ def test_the_iteration_count_ignores_the_reserved_rows() -> None:
         settings=TEST_SETTINGS, shape=PadShape(max_slices=12, max_quotes=32, mesh_nodes=21)
     ).calibrate(None, task)
 
-    assert tall.n_iterations == narrow.n_iterations
-    assert tall.slices[0].params == narrow.slices[0].params
+    assert tall.n_iterations == pytest.approx(narrow.n_iterations, rel=0.1)
+
+    fitted, baseline = tall.slices[0].params, narrow.slices[0].params
+    assert (fitted.a, fitted.b, fitted.rho, fitted.m, fitted.sigma) == pytest.approx(
+        (baseline.a, baseline.b, baseline.rho, baseline.m, baseline.sigma), rel=1e-2
+    )
+
+
+def test_the_iteration_count_excludes_the_reserved_rows() -> None:
+    """The same property where it is exact: one reservation, one compilation, and the adapter's own
+    array of evaluations rather than two fits compared across shapes.
+
+    Reaching past the port for ``_compiled`` is what makes the claim checkable at all. Reading the
+    exclusion off two reservations -- the test above -- can only see the padding through arithmetic
+    that is not bit-stable across shapes, which is why that one states the property loosely. Here
+    both numbers come off one rectangle and nothing rounds between them.
+
+    The second assertion is what stops the first from passing vacuously: if a reserved lane's
+    search were free, masking it out would be indistinguishable from leaving it in.
+    """
+    shape = PadShape(max_slices=12, max_quotes=32, mesh_nodes=21)
+    task = one_slice(svi_task())
+    padded = pad(task, shape, TEST_SETTINGS.durrleman_mesh_margin)
+    _, cold = _compiled(TEST_SETTINGS, shape)
+
+    spent = np.asarray(cold(_to_batch(padded)).evaluations)
+    result = JaxCalibrator(settings=TEST_SETTINGS, shape=shape).calibrate(None, task)
+
+    assert result.n_iterations == int(spent[np.asarray(padded.slice_mask)].sum())
+    assert result.n_iterations < int(spent.sum())
 
 
 def test_a_reserved_row_really_does_run_a_search_of_its_own() -> None:

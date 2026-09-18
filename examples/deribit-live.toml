@@ -1,0 +1,159 @@
+# The live venue, end to end -- the first configuration in this repository that opens a socket:
+#
+#     uv sync --extra deribit
+#     uv run volengine run --config examples/deribit-live.toml --duration 120 --metrics
+#     uv run volengine record --config examples/deribit-live.toml --recording btc-1h.jsonl --duration 3600
+#     uv run volengine replay --config examples/deribit-live.toml --recording btc-1h.jsonl
+#
+# The second command is how the golden fixture of Design §3 (ADR-004) is produced: the real BTC
+# chain, written as the normalised stream `RecordingSink` speaks, replayable byte for byte through
+# the whole engine. Its committable form is `tests/fixtures/deribit-btc-2026-09-18.jsonl` -- thirty
+# seconds of two expiries, recorded through this file by `tests/fixtures/record_deribit_fixture.py`
+# -- and `tests/entrypoints/test_deribit_fixture.py` replays it under this very configuration on
+# every test run. Where the full hour lives is still open (`docs/SEAMS.md`).
+#
+# Nothing here is a secret: discovery and the ticker channels are the venue's public API, so no key
+# is needed. Point `ws_url` and `rest_url` at `test.deribit.com` to run against the test network.
+#
+# Every threshold below was measured against that recording, replayed through `QuoteChain` at one
+# snapshot a second, and the measurement is written beside the value it defends. The chain on the
+# day: 928 options over 12 expiries, at most 66 strikes an expiry; the fixture's two expiries hold
+# 250 of them, 84.8% quoted on both sides at every snapshot.
+
+[[market]]
+id = "BTC-DERIBIT"
+underlying = "BTC"
+provider = "deribit"
+# ADR-021: within this the venue's stamp is believed. Measured: the venue's stamp trails our
+# receipt by 1.5 s at the median and 2.7 s at worst on the fixture -- transport plus the loop's
+# own decoding of the whole chain's traffic -- so a minute is the tolerance for a machine whose
+# NTP has wandered, not for anything seen.
+max_skew_seconds = 60.0
+# How often the inventory is asked for again (F3-C). Strikes are listed as the underlying moves
+# and a whole expiry dies at 08:00 UTC every day; without this a session crossing that hour keeps
+# the dead instruments' last quotes forever. Five minutes is well inside how long a new strike
+# takes to gather a quote worth having.
+rediscovery_seconds = 300.0
+
+[market.conventions]
+day_count = "ACT/365F"
+expiry_time_utc = 08:00:00
+# Inverse: premiums are quoted in BTC, and the adapter multiplies them by the ticker's own
+# forward before the chain sees them, so every price downstream is in the strike's currency.
+numeraire = "INVERSE"
+forward_method = "PROVIDER_UNDERLYING"
+
+[market.admissibility]
+# Half the mid. Measured on the fixture's final snapshot: the relative spread is 2.3% at the
+# median, 33% at the 90th percentile and 67% at the 95th, and this line flags 16 of 212 quotes --
+# the deep wings quoted at one tick against nothing. Ingestion flags; the calibrator weights.
+max_spread_rel = 0.5
+# The 100 ms ticker republishes on every change, so a quote older than this is one nobody has
+# touched. Measured: no quote was older than 3.3 s at any snapshot of the fixture, which is what a
+# thirty-second recording can say; how a thirty-second threshold behaves waits on the hour.
+max_age_seconds = 30.0
+# The fixture lists strikes out to k = -1.38 and k = +1.41; past a log-moneyness of one the
+# quotes invert to volatilities of two and three hundred per cent at one tick, and this line
+# flags 16 of 212. Wider than the synthetic file, because the real chain is wider.
+moneyness_range = [-1.0, 1.0]
+max_iv_divergence_bp = 500.0
+convexity_tolerance = 0.0005
+# One contract is one BTC on this venue and the minimum lot is a tenth. Measured: 11.5% of the
+# two-sided updates rest below one contract on a side, 6% at the minimum lot -- placeholders,
+# flagged (23 of 212 quotes) and down-weighted rather than dropped.
+min_size = 1.0
+
+[market.snapshot]
+cadence_seconds = 1.0
+material_move_threshold = 0.002
+# Judged on the *admissible* ratio -- quotes with a usable mid and not one flag over the known
+# universe -- which the fixture holds at 0.66 at every snapshot under the lines above (0.85 of the
+# universe is two-sided; the flags take the rest). Half is a floor a dead feed breaches and a
+# quiet minute does not; 0.6 would have called the recorded chain healthy by six points.
+min_coverage_ratio = 0.5
+max_quiet_seconds = 5.0
+
+# --- the venue's transport
+#
+# Read by `DeribitProvider` alone; a `[market.deribit]` beside any other provider is refused rather
+# than ignored. Present, the table is complete. These are the adapter's own defaults, spelled out so
+# that this file is the one place to change them.
+
+[market.deribit]
+ws_url = "wss://www.deribit.com/ws/api/v2"
+rest_url = "https://www.deribit.com/api/v2"
+# The venue's heartbeat: it sends one on this interval and a `test_request` the client must
+# answer, or it disconnects the client. Ten seconds is the venue's minimum.
+heartbeat_seconds = 30.0
+# Silence longer than this is a dead connection -- a half-open socket raises nothing on its own.
+# Two and a half heartbeats: margin for a slow hop, none for a dead one.
+silence_timeout_seconds = 75.0
+# Exponential backoff between attempts, from the floor to the ceiling. A venue down for an hour
+# is polled once a minute.
+reconnect_initial_seconds = 1.0
+reconnect_max_seconds = 60.0
+request_timeout_seconds = 10.0
+# The whole chain is subscribed in four messages rather than one the size of the frame limit.
+subscribe_batch_size = 250
+
+[calibration]
+calibrators = ["svi-scipy"]
+
+[calibration.grid]
+# Wider than the quoted body and narrower than the listed wings, for the reasons the synthetic
+# file gives; the arithmetic behind a node count is in `walking-skeleton.toml`.
+k_min = -0.6
+k_max = 0.6
+n_nodes = 25
+
+[calibration.weighting]
+spread_scale = 0.05
+flagged_factor = 0.25
+unpaired_itm_factor = 0.1
+
+[calibration.acceptance]
+# Measured on the fixture's last snapshot with the tuning below: the seven-day slice fits to
+# 80.6 bp weighted RMSE and the three-month one to 18.7 bp, with a worst single quote 40 vol
+# points off in a far wing the weights have already reduced to a thousandth. Two vol points lets
+# both go out and refuses a collapsed slice; the default tuning left the seven-day one
+# unconverged at the same RMSE, which is what the fit table is for.
+max_rmse_vol_bp = 200.0
+
+[calibration.fit]
+# The scipy calibrator's tuning, in full because the table is complete when present. Two values
+# differ from what the calibrator ships with, and the fixture's seven-day slice is the reason: its
+# one-tick asks in the wings invert to 200-300% volatility and hold the loss on a plateau. At the
+# default Huber scale of 100 bp it does not converge within 2000 evaluations; at 300 bp -- a
+# residual past which a quote is an outlier rather than a measurement -- it converges to 80.6 bp
+# RMSE within 1000 evaluations and not within the default 500, cold in 330 ms and warm in 250 ms.
+# Measured over 300, 500 and 1000 bp: the scale is not sensitive above 300, the budget is.
+huber_scale_bp = 300.0
+durrleman_penalty_bp = 10000.0
+durrleman_mesh_nodes = 51
+durrleman_mesh_margin = 0.5
+min_quotes_for_free_shape = 5
+ridge_bp = 5.0
+max_nfev = 1000
+
+[risk]
+writer = "console"
+
+[risk.freshness]
+warn_seconds = 30.0
+reject_seconds = 120.0
+
+[risk.report]
+discount = 1.0
+
+[risk.report.bumps]
+forward_rel = 0.01
+vol_abs = 0.01
+
+[[risk.position]]
+underlying = "BTC"
+# A quarterly the venue lists today (`BTC-25DEC26-…`), inside the grid's tenor axis. TOML has no
+# relative date, so this has to be bumped once it passes -- see the note in `synthetic-svi.toml`.
+expiry = 2026-12-25T08:00:00Z
+strike = 80000.0
+kind = "CALL"
+quantity = 1.0

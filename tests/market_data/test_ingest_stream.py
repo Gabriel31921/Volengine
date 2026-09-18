@@ -11,8 +11,10 @@ from __future__ import annotations
 import pytest
 
 from tests.market_data.builders import (
+    FAR,
     FORWARD,
     NOW,
+    ShiftingProvider,
     StubProvider,
     make_chain,
     make_instrument,
@@ -23,15 +25,18 @@ from tests.support import RecordingMetrics
 from volengine.contracts.events import ChainCompositionChanged, Event, SnapshotReady
 from volengine.market_data.application.build_snapshot import BuildSnapshotUseCase
 from volengine.market_data.application.ingest_stream import IngestStreamUseCase
-from volengine.market_data.domain.option_quote import OptionKindD, QuoteUpdate
+from volengine.market_data.domain.errors import MarketDataError
+from volengine.market_data.domain.option_quote import InstrumentId, OptionKindD, QuoteUpdate
+from volengine.market_data.domain.quote_chain import QuoteChain
 from volengine.platform.clock import ManualClock
 
 
 def make_loop(
-    provider: StubProvider,
+    provider: StubProvider | ShiftingProvider,
     cadence_seconds: float = 1.0,
+    chain: QuoteChain | None = None,
 ) -> tuple[IngestStreamUseCase, RecordingMetrics]:
-    chain = make_chain()
+    chain = chain if chain is not None else make_chain()
     clock = ManualClock(NOW)
     metrics = RecordingMetrics()
     build = BuildSnapshotUseCase(
@@ -129,6 +134,70 @@ async def test_the_second_composition_event_carries_the_whole_set() -> None:
     latest = [event for event in events if isinstance(event, ChainCompositionChanged)][-1]
 
     assert len(latest.instruments) == 2
+
+
+# --- rediscovery (F3-C)
+
+
+async def test_rediscovery_announces_nothing_when_the_universe_stands() -> None:
+    provider = ShiftingProvider(updates=two_sided(), universes=[legs()])
+    loop, _ = make_loop(provider)
+    await drain(loop)
+
+    assert await loop.rediscover() is None
+
+
+async def test_rediscovery_announces_the_moved_universe_as_a_whole() -> None:
+    """Never a delta (ADR-013): the event carries every live instrument, born and surviving."""
+    provider = ShiftingProvider(
+        updates=two_sided(), universes=[legs(), [*legs(), make_instrument(expiry=FAR)]]
+    )
+    loop, _ = make_loop(provider)
+    await drain(loop)
+
+    event = await loop.rediscover()
+
+    assert isinstance(event, ChainCompositionChanged)
+    assert len(event.instruments) == 3
+
+
+async def test_rediscovery_forgets_the_observations_of_what_died() -> None:
+    """Why the poll exists: an expired strike's last quote must not keep ageing in the chain."""
+    chain = make_chain()
+    provider = ShiftingProvider(updates=two_sided(), universes=[legs(), [make_instrument()]])
+    loop, _ = make_loop(provider, chain=chain)
+    await drain(loop)
+    assert chain.stats(NOW).n_quotes_total == 2
+
+    await loop.rediscover()
+
+    assert chain.stats(NOW).n_quotes_total == 1
+
+
+async def test_rediscovery_asks_the_provider_each_time() -> None:
+    provider = ShiftingProvider(updates=[], universes=[legs()])
+    loop, _ = make_loop(provider)
+    await drain(loop)
+
+    await loop.rediscover()
+    await loop.rediscover()
+
+    assert provider.discoveries == 3
+
+
+async def test_a_failed_rediscovery_is_not_swallowed_here() -> None:
+    """Whether a failed poll ends a session is the composition root's call, so it must see it."""
+    provider = ShiftingProvider(updates=[], universes=[legs(), MarketDataError("REST is down")])
+    loop, _ = make_loop(provider)
+    await drain(loop)
+
+    with pytest.raises(MarketDataError, match="REST is down"):
+        await loop.rediscover()
+
+
+def legs() -> list[InstrumentId]:
+    """Both legs of the default strike: the universe ``two_sided()`` quotes, so nothing is born."""
+    return [make_instrument(kind=kind) for kind in (OptionKindD.CALL, OptionKindD.PUT)]
 
 
 # --- lifetime

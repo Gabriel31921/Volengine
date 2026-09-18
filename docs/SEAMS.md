@@ -34,6 +34,45 @@ close naturally in a later phase.
   rather than quote a volatility with no digits in it, which turns the wing into a loud failure
   and not a silent one. Closing it means a different formulation for the wings (a control variate
   against Black-76 was tried and does not help at a realistic vol of vol), not a smaller tolerance.
+- **The full hour of the golden fixture has no home yet.** What is committed is its committable
+  form: `tests/fixtures/deribit-btc-2026-09-18.jsonl`, thirty seconds of two real expiries
+  recorded through the engine (`tests/fixtures/README.md`), replayed by
+  `tests/entrypoints/test_deribit_fixture.py` on every run. The hour `Plan.md` names is 14 MB a
+  minute at the full chain and not a file for plain git; whether it lives in LFS, an artefact
+  bucket or as a longer narrowed excerpt is the owner's decision, and the admissibility numbers in
+  `examples/deribit-live.toml` are measured on the thirty seconds, not on the hour.
+- **The ingestion loop consumes a full Deribit chain at about the rate the venue produces it.**
+  Measured while recording the fixture: 928 instruments tick at ~450 updates/s, and
+  `IngestStreamUseCase` alone -- no recorder, no fit -- replays 75 s of them in 88 s (432/s), so
+  live the receipt stamp `ts_local` falls behind the venue by 0.55 s every second, 38 s after 90 s.
+  The cost is `BuildSnapshotUseCase.build` computing full chain stats on *every* tick before the
+  policy consults the cadence -- the claim in `ingest_stream.py` that `should_emit` short-circuits
+  "long before it touches a quote" is not true of the call as written -- and the scipy fit holding
+  the GIL for seconds on a twelve-expiry chain makes it worse. Narrowed to two expiries the loop
+  keeps up with a flat 1.5 s lag. F3-F's hardening block owns it; a cadence check before the stats
+  is the obvious first move.
+- **A replay of a live recording can stall at one snapshot.** The first snapshot rests on the
+  first quote the venue sent, the movement filter measures only the instruments in the baseline
+  that snapshot left, and `cli._without_heartbeat` drops the timer that would rescue a live run --
+  so `volengine replay` over `examples/deribit-live.toml` publishes the one-quote degraded snapshot
+  and nothing after it unless that first instrument moves by the threshold. The E2E opens the
+  filter (`material_move_threshold = 0.0`) and says so; the same file live is rescued by
+  `max_quiet_seconds`. Recording the heartbeat's occasions in the file is the closing move already
+  named under `_without_heartbeat` below.
+- **`DeribitProvider` reports through a `MetricsSink` nobody wires.** Reconnects, silence, refused
+  channels and dropped frames are counted through the context's own port, and the registry cannot
+  hand a provider the engine's sink -- `ProviderFactory` receives a `MarketConfig` and nothing else
+  (ADR-022), the same seam that keeps the clock out. Under `default_adapters()` those counters go
+  to a null sink; a test, or a future factory signature, is what sees them.
+- **The silence timeout is never exercised against real time.** `DeribitSettings` insists the
+  timeout exceed a heartbeat and a heartbeat exceed the venue's ten-second floor, so no test can
+  wait it out; `test_silence_past_the_timeout_is_treated_as_a_drop` has the fake raise what
+  `asyncio.wait_for` would and asserts the provider's answer. What is not asserted is that the
+  `wait_for` is armed with the configured number.
+- **Rediscovery can churn an instrument born between two polls.** `IngestStreamUseCase.rediscover`
+  replaces the live set with the venue's inventory; a strike that ticked into the chain after the
+  inventory was taken but before it was applied is dropped and re-announced on its next tick. Two
+  composition events where one would do, and no wrong state in between.
 - **The Heston generator has no TOML home.** `[[market.synthetic.slice]]` builds `SVIParamsSpec`,
   so a Heston market is reachable from Python and from the tests and not from a configuration
   file. Wiring it needs a table of its own and a rule for which of the two generators a file may
@@ -61,8 +100,8 @@ close naturally in a later phase.
   compiled signature, so widening it is a new compilation and therefore a restart. A task with more
   expiries or more strikes than reserved is refused by `adapters/padding.pad` with a
   `CalibrationError` naming the number it would need, and the use case republishes the last good
-  surface. Handling `ChainCompositionChanged` so the reservation follows a growing chain is F3-C's,
-  which is where that event is first produced.
+  surface. F3-C now produces `ChainCompositionChanged` on every rediscovery, so the signal exists;
+  nothing on this side consumes it yet, and the reservation is still sized by hand.
 - **A fit is not bit-stable across two padded reservations.** The searches run inside a `vmap` over
   the rows, and XLA vectorises each row's own reduction across that batch axis — so how many rows
   were reserved decides how a row's thirty-two-lane sum is associated, and float32 addition is not

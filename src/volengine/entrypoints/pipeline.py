@@ -20,16 +20,22 @@ the engine be ignorant of the wiring.
   produces silence, which is the one symptom downstream cannot tell from a dead process. The timer
   in :meth:`Pipeline._heartbeat` races the stream and asks the same use case the same question on
   a clock instead of on a tick.
+* It owns **rediscovery**, the same shape one door down (F3-C). An option chain is not a fixed
+  set -- strikes are born as the underlying walks and a whole expiry dies at 08:00 UTC -- and the
+  port that lists it is a pull call the stream cannot re-issue on its own.
+  :meth:`Pipeline._rediscover` asks ``IngestStreamUseCase.rediscover`` on
+  ``MarketConfig.rediscovery_seconds`` and publishes the ``ChainCompositionChanged`` it answers
+  with; a failed poll is counted and the session goes on with the universe it had.
 * It does **not** own the mathematics, the policies or the language. Nothing here decides whether
   a fit is good, whether a snapshot is worth publishing or how old is too old.
 
 **Adapters arrive by name.** :func:`default_adapters` is the registry that maps a configured
 string -- ``provider = "constant"`` -- onto the callable that builds the object, and it is the
-only place in the engine that *constructs* one. It holds six: the walking skeleton's three and
-F2's three beside them, so a file may name a constant feed or a synthetic one, a mean or a fit, a
-console or a file. A name it does not hold fails here with a message that says which one was not
-registered. Passing the registry into :func:`build_pipeline` rather than reaching for it keeps the
-graph testable with fakes.
+only place in the engine that *constructs* one. It holds seven: the walking skeleton's three,
+F2's three beside them, and since F3-C the live venue, so a file may name a constant feed, a
+synthetic one or Deribit, a mean or a fit, a console or a file. A name it does not hold fails here
+with a message that says which one was not registered. Passing the registry into
+:func:`build_pipeline` rather than reaching for it keeps the graph testable with fakes.
 
 **Recording and replay are modes of a run, not entries in that registry** (ADR-004).
 :func:`with_recording` decorates every provider with a tap onto a file; :func:`with_replay`
@@ -72,6 +78,7 @@ import math
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Executor
 from dataclasses import dataclass, replace
+from importlib.util import find_spec
 from pathlib import Path
 
 from volengine.contracts.events import (
@@ -82,6 +89,7 @@ from volengine.contracts.events import (
     SurfaceCalibrated,
 )
 from volengine.entrypoints.config import (
+    DERIBIT_PROVIDER,
     SYNTHETIC_PROVIDER,
     AppConfig,
     CalibrationConfig,
@@ -90,12 +98,14 @@ from volengine.entrypoints.config import (
     RiskConfig,
 )
 from volengine.market_data.adapters.constant import ConstantProvider
+from volengine.market_data.adapters.deribit_ws import DeribitProvider
 from volengine.market_data.adapters.recorded import RecordedProvider, Recording, ReplayClock
 from volengine.market_data.adapters.recorder import RecordingProvider, RecordingSink
 from volengine.market_data.adapters.synthetic import SyntheticProvider
 from volengine.market_data.application.acl import to_snapshot_ready
 from volengine.market_data.application.build_snapshot import BuildSnapshotUseCase
 from volengine.market_data.application.ingest_stream import IngestStreamUseCase
+from volengine.market_data.domain.errors import MarketDataError
 from volengine.market_data.domain.ports import MarketDataProvider
 from volengine.market_data.domain.quote_chain import QuoteChain
 from volengine.market_data.domain.snapshot_policy import SnapshotPolicy
@@ -159,7 +169,7 @@ class Adapters:
 
 
 def default_adapters() -> Adapters:
-    """Every concrete adapter this build knows how to make: two feeds, two producers, two writers.
+    """Every concrete adapter this build knows how to make: three feeds, two producers, two writers.
 
     **The only function in the engine that constructs an adapter**, which is what keeps every
     other module -- and every configuration file -- ignorant of infrastructure. A name it does not
@@ -172,14 +182,15 @@ def default_adapters() -> Adapters:
     threshold that ADR-012 already put somewhere else, and no factory reaches past its own section
     to find one.
 
-    Three of the six take no settings at all, and that is a property of those adapters rather than
-    an oversight: a constant feed, a weighted mean and a console have nothing a deployment could
-    retune. The other three read the sections F2-07 gave them.
+    Three of the seven take no settings at all, and that is a property of those adapters rather
+    than an oversight: a constant feed, a weighted mean and a console have nothing a deployment
+    could retune. The other four read the sections F2-07 and F3-C gave them.
     """
     return Adapters(
         providers={
             "constant": lambda market: ConstantProvider(market.conventions),
             SYNTHETIC_PROVIDER: _synthetic_provider,
+            DERIBIT_PROVIDER: _deribit_provider,
         },
         calibrators={
             FLAT_VOL_ID: lambda _calibration: FlatVolCalibrator(),
@@ -212,6 +223,27 @@ def _synthetic_provider(market: MarketConfig) -> MarketDataProvider:
         return SyntheticProvider(market.conventions, settings.config, settings.start)
     except ValueError as failure:
         raise ConfigError(f"market[{market.market_id}].synthetic: {failure}") from failure
+
+
+DERIBIT_EXTRA_LIBRARIES = ("websockets", "httpx")
+"""What the ``deribit`` extra installs, checked by name before the provider is built."""
+
+
+def _deribit_provider(market: MarketConfig) -> MarketDataProvider:
+    """The live venue, on the market it belongs to and the transport the file gave it.
+
+    The two libraries behind it are an optional extra, imported lazily inside the adapter so that
+    this module -- and the CLI -- import on an installation without them. That makes *this* the
+    place to notice they are missing: at wiring time, with the remedy in the message, rather than
+    as an ``ImportError`` out of the first connection attempt of a session already under way.
+    """
+    missing = [name for name in DERIBIT_EXTRA_LIBRARIES if find_spec(name) is None]
+    if missing:
+        raise ConfigError(
+            f"market[{market.market_id}]: the {DERIBIT_PROVIDER!r} provider needs "
+            f"{', '.join(missing)}, which the 'deribit' extra installs: uv sync --extra deribit"
+        )
+    return DeribitProvider(market.conventions, market.deribit)
 
 
 def _csv_report_writer(risk: RiskConfig) -> ReportWriter:
@@ -386,6 +418,10 @@ class _MarketLoop:
     of ``max_quiet_seconds``, which is the resolution the cadence itself defines.
     """
 
+    rediscovery_seconds: float | None
+    """How often the venue is asked for its universe again, or ``None`` to ask once at start-up.
+    Configuration as written (``MarketConfig.rediscovery_seconds``)."""
+
 
 @dataclass(frozen=True, slots=True)
 class _Producer:
@@ -486,6 +522,7 @@ def build_pipeline(
                     if market.snapshot.max_quiet_seconds is not None
                     else None
                 ),
+                rediscovery_seconds=market.rediscovery_seconds,
             )
         )
 
@@ -728,6 +765,11 @@ class Pipeline:
             for market in self._markets
             if market.heartbeat_seconds is not None
         ]
+        sources += [
+            asyncio.create_task(self._rediscover(market), name=f"rediscovery-{market.market_id}")
+            for market in self._markets
+            if market.rediscovery_seconds is not None
+        ]
         consumers = [asyncio.create_task(runner.run(), name="runner") for runner in self._runners]
         # The stopping rules, kept together: whichever of them completes, the run is over and
         # nothing is drained. Everything else in the wait set finishing means either the feed ran
@@ -836,6 +878,36 @@ class Pipeline:
             if snapshot is not None:
                 self._metrics.counter("pipeline.heartbeat.emitted", market=market.market_id)
                 self._publish(to_snapshot_ready(snapshot))
+
+    async def _rediscover(self, market: _MarketLoop) -> None:
+        """Ask the venue for its universe on a timer, and publish the set when it moved.
+
+        The heartbeat's twin. It calls ``IngestStreamUseCase.rediscover``, which owns the live set
+        and the chain, so the decision of what changed and what to forget stays in the use case;
+        this task supplies the occasion and the topic. Unlike the heartbeat it awaits the network,
+        so the use case's ``await`` is where the stream loop may run in between -- the churn that
+        can cause is the use case's to document, and it does.
+
+        A failed poll -- the venue's REST down, a timeout, an inventory that does not parse -- is
+        counted and the session goes on with the universe it had. Ending a run because one inventory
+        call failed would trade a stale composition, which is measurable, for a dead market, which
+        is not. What is *not* caught is anything that is not a ``MarketDataError``: a provider is
+        expected to translate its transport's failures into the context's hierarchy, and one that
+        does not has a wiring bug that should surface.
+        """
+        poll = market.rediscovery_seconds
+        if poll is None:  # pragma: no cover - the task is not created in that case
+            return
+        while True:
+            await self._clock.sleep(poll)
+            try:
+                event = await market.ingest.rediscover()
+            except MarketDataError:
+                self._metrics.counter("pipeline.rediscovery.failed", market=market.market_id)
+                continue
+            if event is not None:
+                self._metrics.counter("pipeline.rediscovery.changed", market=market.market_id)
+                self._publish(event)
 
     # --- the handlers
 

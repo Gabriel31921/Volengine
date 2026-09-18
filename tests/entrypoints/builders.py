@@ -35,6 +35,7 @@ from volengine.entrypoints.config import (
     SyntheticSettings,
 )
 from volengine.entrypoints.pipeline import Adapters, CalibratorFactory
+from volengine.market_data.adapters.deribit_ws import DeribitSettings
 from volengine.market_data.adapters.synthetic import SVIParamsSpec, SyntheticConfig
 from volengine.market_data.domain.admissibility import AdmissibilityThresholds
 from volengine.market_data.domain.market_conventions import (
@@ -108,6 +109,8 @@ def make_market_config(
     underlying: str = UNDERLYING,
     synthetic: SyntheticSettings | None = None,
     min_coverage_ratio: float = 0.0,
+    deribit: DeribitSettings | None = None,
+    rediscovery_seconds: float | None = None,
 ) -> MarketConfig:
     """One market whose policy publishes on every cadence tick and never marks anything degraded.
 
@@ -141,6 +144,8 @@ def make_market_config(
         provider=provider,
         max_skew_seconds=30.0,
         synthetic=synthetic,
+        deribit=deribit,
+        rediscovery_seconds=rediscovery_seconds,
     )
 
 

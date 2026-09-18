@@ -16,6 +16,7 @@ import pytest
 
 from tests.entrypoints.builders import CONFIG_TOML, replacing, without, write_config
 from volengine.entrypoints.config import AppConfig, ConfigError, load_config
+from volengine.market_data.adapters.deribit_ws import DeribitSettings
 from volengine.market_data.adapters.synthetic import SVIParamsSpec
 from volengine.market_data.domain.market_conventions import DayCount, ForwardMethod, Numeraire
 from volengine.risk.domain.pricing import OptionKindR
@@ -388,3 +389,103 @@ def test_an_output_path_of_one_dot_is_still_the_working_directory(tmp_path: Path
     text = replacing(CONFIG_TOML, 'writer = "console"', 'writer = "csv"\noutput_path = "."')
 
     assert load(tmp_path, text).risk.output_path == Path(".")
+
+
+# --- the venue's transport (F3-C)
+
+
+DERIBIT_TOML = """
+[market.deribit]
+ws_url = "wss://test.deribit.com/ws/api/v2"
+rest_url = "https://test.deribit.com/api/v2"
+heartbeat_seconds = 20.0
+silence_timeout_seconds = 50.0
+reconnect_initial_seconds = 2.0
+reconnect_max_seconds = 30.0
+request_timeout_seconds = 5.0
+subscribe_batch_size = 100
+"""
+"""The transport, appended to the valid file. Every value differs from the adapter's own default,
+so a test asserting one of them cannot pass on a section that was never read."""
+
+
+def deribit(text: str = CONFIG_TOML) -> str:
+    """The valid file, quoted by the live venue and carrying its transport settings."""
+    return replacing(text, "provider =", 'provider = "deribit"') + DERIBIT_TOML
+
+
+def test_the_deribit_table_fills_the_adapter_own_type(tmp_path: Path) -> None:
+    settings = load(tmp_path, deribit()).markets[0].deribit
+
+    assert settings == DeribitSettings(
+        ws_url="wss://test.deribit.com/ws/api/v2",
+        rest_url="https://test.deribit.com/api/v2",
+        heartbeat_seconds=20.0,
+        silence_timeout_seconds=50.0,
+        reconnect_initial_seconds=2.0,
+        reconnect_max_seconds=30.0,
+        request_timeout_seconds=5.0,
+        subscribe_batch_size=100,
+    )
+
+
+def test_a_market_with_no_deribit_table_carries_none(tmp_path: Path) -> None:
+    """Absent is the adapter's defaults, decided by the adapter and not restated here."""
+    assert (
+        load(tmp_path, replacing(CONFIG_TOML, "provider =", 'provider = "deribit"'))
+        .markets[0]
+        .deribit
+        is None
+    )
+
+
+def test_a_missing_key_in_the_deribit_table_names_the_table(tmp_path: Path) -> None:
+    with pytest.raises(ConfigError, match=r"market\[0\].deribit: the key 'ws_url'"):
+        load(tmp_path, without(deribit(), "ws_url"))
+
+
+def test_a_transport_value_the_adapter_refuses_is_blamed_on_its_table(tmp_path: Path) -> None:
+    text = replacing(deribit(), "heartbeat_seconds =", "heartbeat_seconds = 5.0")
+
+    with pytest.raises(ConfigError, match=r"market\[0\].deribit: The heartbeat_seconds"):
+        load(tmp_path, text)
+
+
+def test_a_fractional_batch_size_is_refused(tmp_path: Path) -> None:
+    text = replacing(deribit(), "subscribe_batch_size =", "subscribe_batch_size = 2.5")
+
+    with pytest.raises(ConfigError, match="must be an integer"):
+        load(tmp_path, text)
+
+
+def test_transport_settings_given_to_another_provider_are_refused(tmp_path: Path) -> None:
+    with pytest.raises(ConfigError, match="'deribit' were given to the provider 'constant'"):
+        load(tmp_path, CONFIG_TOML + DERIBIT_TOML)
+
+
+# --- rediscovery (F3-C)
+
+
+def test_the_rediscovery_cadence_is_read(tmp_path: Path) -> None:
+    text = replacing(
+        CONFIG_TOML, "max_skew_seconds =", "max_skew_seconds = 30.0\nrediscovery_seconds = 300.0"
+    )
+
+    assert load(tmp_path, text).markets[0].rediscovery_seconds == 300.0
+
+
+def test_an_absent_rediscovery_cadence_is_none_rather_than_a_default(tmp_path: Path) -> None:
+    """Absent means "discover once", the way an absent heartbeat means "no heartbeat"."""
+    assert load(tmp_path).markets[0].rediscovery_seconds is None
+
+
+@pytest.mark.parametrize("value", ["0.0", "-5.0", "nan", "inf"])
+def test_a_rediscovery_cadence_that_could_not_be_polled_on_is_refused(
+    tmp_path: Path, value: str
+) -> None:
+    text = replacing(
+        CONFIG_TOML, "max_skew_seconds =", f"max_skew_seconds = 30.0\nrediscovery_seconds = {value}"
+    )
+
+    with pytest.raises(ConfigError, match="rediscovery_seconds must be positive and finite"):
+        load(tmp_path, text)

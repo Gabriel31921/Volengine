@@ -72,6 +72,13 @@ ignore_missing_imports = true
 module = ["jax.*", "optax.*"]
 ignore_missing_imports = true
 
+# `websockets` and `httpx` both ship `py.typed`, so with the `deribit` extra installed the Deribit
+# adapter is checked against their real signatures; on the legs that do not install it the two
+# lazy imports inside `market_data/adapters/deribit_*.py` would otherwise be unresolvable.
+[[tool.mypy.overrides]]
+module = ["websockets.*", "httpx.*"]
+ignore_missing_imports = true
+
 [[tool.mypy.overrides]]
 module = [
     "volengine.contracts.*",

@@ -14,6 +14,15 @@ It does **not** publish them. An ``AsyncIterator[Event]`` hands them to the comp
 which owns the bus and the topic names -- so this module has no idea a bus exists, and a test
 drives it with a list.
 
+**Rediscovery is the same shape as the heartbeat, and lives in the same two halves.** ``run``
+discovers once, on the way in; :meth:`IngestStreamUseCase.rediscover` asks the venue again and
+announces the live set if it moved -- strikes born as the underlying walked, and the whole expiry
+that died at 08:00 UTC -- but nothing in this file decides *when* to ask. The cadence is
+configuration (``MarketConfig.rediscovery_seconds``, ADR-012) and the timer is the composition
+root's (``Pipeline._rediscover``), for the reason the port's own docstring gives: the caller decides
+the rediscovery cadence, never the port. Without it a session that crosses an expiry keeps the
+dead instruments' last observations forever, and ``max_age_seconds`` climbs without bound.
+
 **The heartbeat is half here, and the other half is the composition root.**
 ``SnapshotPolicyConfig.max_quiet_seconds`` exists so that a calm market is still heard from, but
 this loop evaluates the policy only when an update *arrives*: by itself it covers a market that is
@@ -134,6 +143,36 @@ class IngestStreamUseCase:
                     yield to_snapshot_ready(snapshot)
         finally:
             await self._provider.close()
+
+    async def rediscover(self) -> Event | None:
+        """Ask the venue for its universe again, and announce it if it moved.
+
+        The composition root calls this on a timer, beside the heartbeat. ``None`` is the ordinary
+        answer -- an inventory identical to the last one is nothing to announce -- and it is the
+        answer a provider whose universe never changes gives every time, so the poll is harmless on
+        the synthetic and constant feeds.
+
+        A moved set is applied to the chain first, which is what forgets the observations of what
+        died (``QuoteChain.set_live_instruments``), and then announced as the whole set (ADR-013).
+        An instrument that ticked into the chain between two polls is already in the live set the
+        stream loop maintains; if the venue's inventory does not list it yet, it is dropped here and
+        re-announced on its next tick -- a harmless churn, and the alternative is a use case forming
+        a view about which of two sources is right.
+
+        Returns:
+            The composition event to publish, or ``None`` when nothing changed.
+
+        Raises:
+            MarketDataError: Whatever the provider's ``discover`` raises when the venue cannot be
+                asked. Not caught here: this object does not know whether a failed poll is worth
+                ending a session over, and the composition root does.
+        """
+        discovered = set(await self._provider.discover())
+        if discovered == self._live:
+            return None
+        self._live = discovered
+        self._chain.set_live_instruments(self._live)
+        return self._composition_event()
 
     def _composition_event(self) -> Event:
         """Announce the live set as it stands now.

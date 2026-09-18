@@ -13,7 +13,10 @@ rule is a report count, so every test below runs in milliseconds and always in t
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
+from contextlib import suppress
 from datetime import timedelta
+from importlib.util import find_spec
 from pathlib import Path
 
 import pytest
@@ -22,6 +25,7 @@ from tests.entrypoints.builders import (
     CALIBRATOR_NAME,
     MARKET_ID,
     BlockingProvider,
+    RecordingBus,
     RecordingWriter,
     SlowCalibrator,
     make_adapters,
@@ -34,7 +38,14 @@ from tests.entrypoints.builders import (
     one_instrument,
     two_sided,
 )
-from tests.market_data.builders import NOW, StubProvider
+from tests.market_data.builders import (
+    FORWARD,
+    NOW,
+    ShiftingProvider,
+    StubProvider,
+    make_deribit_settings,
+    make_instrument,
+)
 from tests.parametric_pricing.builders import StubCalibrator, make_market_snapshot
 from tests.risk.builders import make_calibrated_surface
 from tests.support import RecordingMetrics
@@ -44,7 +55,12 @@ from volengine.contracts.events import (
     SnapshotReady,
     SurfaceCalibrated,
 )
-from volengine.entrypoints.config import SYNTHETIC_PROVIDER, AppConfig, ConfigError
+from volengine.entrypoints.config import (
+    DERIBIT_PROVIDER,
+    SYNTHETIC_PROVIDER,
+    AppConfig,
+    ConfigError,
+)
 from volengine.entrypoints.pipeline import (
     Adapters,
     Pipeline,
@@ -56,7 +72,10 @@ from volengine.entrypoints.pipeline import (
     surface_topic,
     topic_of,
 )
+from volengine.market_data.adapters.deribit_ws import DeribitProvider, DeribitSettings
 from volengine.market_data.adapters.synthetic import SyntheticConfig, SyntheticProvider
+from volengine.market_data.domain.errors import MarketDataError
+from volengine.market_data.domain.option_quote import InstrumentId, OptionKindD
 from volengine.parametric_pricing.adapters.scipy_calibrator import FitSettings, ScipyCalibrator
 from volengine.parametric_pricing.domain.errors import CalibrationError
 from volengine.platform.bus import InProcessConflatingBus
@@ -421,7 +440,7 @@ def test_a_market_with_nothing_in_the_book_is_refused() -> None:
 
 
 def test_the_default_registry_holds_every_adapter_this_build_can_make() -> None:
-    """The six names a shipped configuration may use: F1-08's three and F2's three beside them.
+    """The seven names a shipped configuration may use: F1-08's three, F2's three, F3-C's venue.
 
     Names rather than objects: the factories are what ``build_pipeline`` calls, and asserting on
     what they build here would only repeat the end-to-end tests in ``test_walking_skeleton.py``
@@ -430,7 +449,7 @@ def test_the_default_registry_holds_every_adapter_this_build_can_make() -> None:
     """
     adapters = default_adapters()
 
-    assert set(adapters.providers) == {"constant", "synthetic"}
+    assert set(adapters.providers) == {"constant", "synthetic", "deribit"}
     assert set(adapters.calibrators) == {"flat-vol", "svi-scipy"}
     assert set(adapters.writers) == {"console", "csv"}
 
@@ -485,6 +504,39 @@ def test_a_synthetic_session_that_would_outlive_its_own_expiry_names_the_market(
 
     with pytest.raises(ConfigError, match=r"market\[BTC-DERIBIT\].synthetic"):
         default_adapters().providers[SYNTHETIC_PROVIDER](market)
+
+
+HAS_DERIBIT_EXTRA = all(find_spec(name) is not None for name in ("websockets", "httpx"))
+
+
+@pytest.mark.skipif(not HAS_DERIBIT_EXTRA, reason="needs the deribit extra")
+def test_the_deribit_feed_is_built_from_the_settings_the_file_carries() -> None:
+    settings = make_deribit_settings(heartbeat_seconds=15.0)
+    market = make_market_config(provider=DERIBIT_PROVIDER, deribit=settings)
+
+    provider = default_adapters().providers[DERIBIT_PROVIDER](market)
+
+    assert isinstance(provider, DeribitProvider)
+    assert provider.settings == settings
+
+
+@pytest.mark.skipif(not HAS_DERIBIT_EXTRA, reason="needs the deribit extra")
+def test_a_deribit_feed_with_no_settings_falls_back_to_the_adapter_defaults() -> None:
+    market = make_market_config(provider=DERIBIT_PROVIDER)
+
+    provider = default_adapters().providers[DERIBIT_PROVIDER](market)
+
+    assert isinstance(provider, DeribitProvider)
+    assert provider.settings == DeribitSettings()
+
+
+@pytest.mark.skipif(HAS_DERIBIT_EXTRA, reason="only observable without the deribit extra")
+def test_a_deribit_feed_without_the_extra_is_refused_with_the_remedy() -> None:
+    """At wiring time, naming the extra -- not an ``ImportError`` out of the first connection."""
+    market = make_market_config(provider=DERIBIT_PROVIDER)
+
+    with pytest.raises(ConfigError, match="uv sync --extra deribit"):
+        default_adapters().providers[DERIBIT_PROVIDER](market)
 
 
 def test_the_scipy_calibrator_is_handed_the_tuning_the_file_states() -> None:
@@ -570,3 +622,95 @@ async def test_a_duration_of_nan_is_refused_rather_than_slept_on() -> None:
 
     with pytest.raises(ValueError, match="duration must be positive"):
         await pipeline.run(duration_seconds=float("nan"))
+
+
+# --- rediscovery, the heartbeat's twin (F3-C)
+
+
+async def until(condition: Callable[[], bool], hops: int = 500) -> None:
+    """Yield the loop until ``condition`` holds, or fail with a message instead of hanging.
+
+    Hops rather than seconds: under a ``ManualClock`` the rediscovery task is what moves time,
+    and every one of its polls costs a bounded number of loop iterations, so the condition is
+    reached deterministically or not at all.
+    """
+    for _ in range(hops):
+        if condition():
+            return
+        await asyncio.sleep(0)
+    raise AssertionError(f"the condition did not hold within {hops} hops")
+
+
+def shifting_pipeline(
+    universes: list[list[InstrumentId] | MarketDataError],
+) -> tuple[ShiftingProvider, RecordingBus, RecordingMetrics, Pipeline]:
+    provider = ShiftingProvider(updates=two_sided(), universes=universes, block=True)
+    metrics = RecordingMetrics()
+    bus = RecordingBus(metrics)
+    config = make_app_config(markets=(make_market_config(rediscovery_seconds=5.0),))
+    pipeline = build_pipeline(
+        config,
+        make_adapters(provider, {CALIBRATOR_NAME: StubCalibrator()}, RecordingWriter()),
+        ManualClock(NOW),
+        bus,
+        metrics,
+    )
+    return provider, bus, metrics, pipeline
+
+
+async def test_rediscovery_publishes_the_universe_when_it_moved() -> None:
+    both = [make_instrument(kind=kind) for kind in (OptionKindD.CALL, OptionKindD.PUT)]
+    born = make_instrument(strike=FORWARD + 5_000.0)
+    _, bus, _, pipeline = shifting_pipeline([both, [*both, born]])
+    run = asyncio.create_task(pipeline.run())
+
+    await until(lambda: len(bus.events_of(ChainCompositionChanged)) >= 2)
+    run.cancel()
+    with suppress(asyncio.CancelledError):
+        await run
+
+    latest = bus.events_of(ChainCompositionChanged)[-1]
+    assert len(latest.instruments) == 3
+
+
+async def test_rediscovery_is_counted_where_it_changes_the_universe() -> None:
+    both = [make_instrument(kind=kind) for kind in (OptionKindD.CALL, OptionKindD.PUT)]
+    _, _, metrics, pipeline = shifting_pipeline([both, [make_instrument()]])
+    run = asyncio.create_task(pipeline.run())
+
+    await until(lambda: "pipeline.rediscovery.changed" in metrics.counter_names())
+    run.cancel()
+    with suppress(asyncio.CancelledError):
+        await run
+
+
+async def test_a_failed_rediscovery_is_counted_and_the_session_goes_on() -> None:
+    both = [make_instrument(kind=kind) for kind in (OptionKindD.CALL, OptionKindD.PUT)]
+    provider, _, metrics, pipeline = shifting_pipeline([both, MarketDataError("REST is down")])
+    run = asyncio.create_task(pipeline.run())
+
+    await until(lambda: metrics.counter_names().count("pipeline.rediscovery.failed") >= 2)
+
+    assert not run.done()
+    assert not provider.closed
+    run.cancel()
+    with suppress(asyncio.CancelledError):
+        await run
+
+
+async def test_a_market_without_a_rediscovery_cadence_discovers_once() -> None:
+    both = [make_instrument(kind=kind) for kind in (OptionKindD.CALL, OptionKindD.PUT)]
+    provider = ShiftingProvider(updates=two_sided(), universes=[both], block=False)
+    writer = RecordingWriter()
+    metrics = RecordingMetrics()
+    pipeline = build_pipeline(
+        make_app_config(markets=(make_market_config(),)),
+        make_adapters(provider, {CALIBRATOR_NAME: StubCalibrator()}, writer),
+        ManualClock(NOW),
+        InProcessConflatingBus(metrics),
+        metrics,
+    )
+
+    await asyncio.wait_for(pipeline.run(), timeout=5.0)
+
+    assert provider.discoveries == 1

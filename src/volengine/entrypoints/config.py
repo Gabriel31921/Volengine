@@ -15,22 +15,24 @@ the ones the contexts own. That is why the TOML keys are spelled exactly like th
 fill: one vocabulary, no translation table to keep honest. ``Implementation.md`` lists the mirror
 types; ADR-022 records why they are not here.
 
-**Two adapters have settings of their own, and they are read here too.** ``SyntheticConfig``
-(the invented market of ``market_data/adapters/synthetic.py``) and ``FitSettings`` (the empirical
-half of the scipy fit) are numbers a deployment retunes without touching Python, which is exactly
-what ADR-012 asks to arrive as data -- so ``[market.synthetic]`` and ``[calibration.fit]`` fill
-those two types directly, on the same terms as every threshold above. The cost is that this module
-imports two ``*/adapters/`` modules, which until now only ``pipeline.default_adapters`` did --
-**ADR-028**, which supersedes that sentence of ADR-022 and records what the old claim was
-protecting. It buys the same thing the rest of the file buys: no mirror type, no second copy of
-seven guards.
+**Three adapters have settings of their own, and they are read here too.** ``SyntheticConfig``
+(the invented market of ``market_data/adapters/synthetic.py``), ``FitSettings`` (the empirical
+half of the scipy fit) and ``DeribitSettings`` (the transport knobs of the live venue, F3-C) are
+numbers a deployment retunes without touching Python, which is exactly what ADR-012 asks to arrive
+as data -- so ``[market.synthetic]``, ``[calibration.fit]`` and ``[market.deribit]`` fill those
+three types directly, on the same terms as every threshold above. The cost is that this module
+imports three ``*/adapters/`` modules, which until F2-07 only ``pipeline.default_adapters`` did --
+**ADR-028**, which supersedes that sentence of ADR-022, records what the old claim was protecting,
+and names the Deribit field as the second one ``MarketConfig`` would grow. It buys the same thing
+the rest of the file buys: no mirror type, no second copy of the guards.
 What has *not* changed is that a file still cannot reach an object -- ``provider``, ``calibrators``
 and ``writer`` are names, resolved by a registry that lives elsewhere.
 
-**Both sections are optional, and complete when present.** Absent means "the adapter's own
-defaults", which are argued for in its docstring and are what every test bends one knob of; a
+**Every adapter section is optional, and complete when present.** Absent means "the adapter's
+own defaults", which are argued for in its docstring and are what every test bends one knob of; a
 partial table would need this module to restate every value the file left out, which is the mirror
-type it just refused. So a file either says nothing about the synthetic feed or describes all of it.
+type it just refused. So a file either says nothing about the synthetic feed or describes all of it,
+and the same for the venue's transport.
 
 **Every failure is a ``ConfigError`` naming the table it came from.** A domain constructor raises
 ``ValueError("The reject_seconds must be above warn_seconds")``, which is the right message and
@@ -51,6 +53,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
+from volengine.market_data.adapters.deribit_ws import DeribitSettings
 from volengine.market_data.adapters.synthetic import SVIParamsSpec, SyntheticConfig
 from volengine.market_data.domain.admissibility import AdmissibilityThresholds
 from volengine.market_data.domain.market_conventions import (
@@ -86,13 +89,16 @@ class ConfigError(Exception):
 
 
 SYNTHETIC_PROVIDER = "synthetic"
-"""The one provider that takes settings, and the name of the table that carries them.
+"""The first provider that takes settings, and the name of the table that carries them.
 
 Spelled once, here, and imported by ``pipeline.default_adapters`` as the registry key: the table
 is named after the provider it configures, so the two spellings have to agree or a
 ``[market.synthetic]`` beside ``provider = "constant"`` would be a block of numbers nobody reads
 and nobody reports.
 """
+
+DERIBIT_PROVIDER = "deribit"
+"""The second, on the same terms: ``[market.deribit]`` is refused beside any other provider."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,6 +166,27 @@ class MarketConfig:
     get is a shared key whose meaning depends on which name sits above it.
     """
 
+    deribit: DeribitSettings | None = None
+    """The venue's transport, when ``provider`` is :data:`DERIBIT_PROVIDER`, else ``None``.
+
+    The second field ADR-028 said this type would grow, on exactly its terms: the adapter's own
+    type, named after the one adapter that reads it, refused beside any other. Absent with
+    ``provider = "deribit"`` means the defaults the adapter ships with -- the production URLs and
+    the timings argued for in its docstring.
+    """
+
+    rediscovery_seconds: float | None = None
+    """How often the venue is asked for its universe again, or ``None`` to ask once at start-up.
+
+    A market-level cadence rather than a provider setting, because the timer that asks is the
+    composition root's (``Pipeline._rediscover``) and the use case that announces the answer is
+    the same on every provider; the synthetic feed answers the same set every time and the poll
+    is harmless there. Absent is the right default for a session shorter than the nearest expiry
+    and the wrong one for a live day on a venue with daily options: without it the instruments
+    that expired at 08:00 UTC keep their last observations forever, and every quality number
+    that reads the oldest one climbs without bound. Positive and finite when present.
+    """
+
     @property
     def market_id(self) -> str:
         """Identity of the market, as every published event will spell it."""
@@ -181,6 +208,18 @@ class MarketConfig:
             raise ValueError(
                 f"The settings of {SYNTHETIC_PROVIDER!r} were given to the provider "
                 f"{self.provider!r}, which would never read them"
+            )
+        if self.deribit is not None and self.provider != DERIBIT_PROVIDER:
+            raise ValueError(
+                f"The settings of {DERIBIT_PROVIDER!r} were given to the provider "
+                f"{self.provider!r}, which would never read them"
+            )
+        if self.rediscovery_seconds is not None and (
+            not math.isfinite(self.rediscovery_seconds) or self.rediscovery_seconds <= 0
+        ):
+            raise ValueError(
+                f"The rediscovery_seconds must be positive and finite, got "
+                f"{self.rediscovery_seconds}"
             )
 
 
@@ -345,6 +384,37 @@ def _market(raw: Mapping[str, Any], where: str) -> MarketConfig:
             provider=_text(raw, "provider", where),
             max_skew_seconds=_number(raw, "max_skew_seconds", where),
             synthetic=_synthetic(raw, where),
+            deribit=_deribit(raw, where),
+            # Absent means "discover once", the same way an absent `max_quiet_seconds` means
+            # "no heartbeat": a real choice a file states by omission, not a default to fill.
+            rediscovery_seconds=_optional_number(raw, "rediscovery_seconds", where),
+        ),
+    )
+
+
+def _deribit(raw: Mapping[str, Any], where: str) -> DeribitSettings | None:
+    """The venue's transport, when the file describes it.
+
+    The same terms as :func:`_synthetic`: absent is the adapter's defaults, present is complete.
+    The keys are spelled exactly like the fields of ``DeribitSettings``, whose ``__post_init__``
+    is the one place their invariants live -- the heartbeat floor the venue imposes, the silence
+    timeout that must exceed it, the backoff ceiling that must not sit below its floor.
+    """
+    settings = _optional_table(raw, DERIBIT_PROVIDER, where)
+    if settings is None:
+        return None
+    place = f"{where}.{DERIBIT_PROVIDER}"
+    return _built(
+        place,
+        lambda: DeribitSettings(
+            ws_url=_text(settings, "ws_url", place),
+            rest_url=_text(settings, "rest_url", place),
+            heartbeat_seconds=_number(settings, "heartbeat_seconds", place),
+            silence_timeout_seconds=_number(settings, "silence_timeout_seconds", place),
+            reconnect_initial_seconds=_number(settings, "reconnect_initial_seconds", place),
+            reconnect_max_seconds=_number(settings, "reconnect_max_seconds", place),
+            request_timeout_seconds=_number(settings, "request_timeout_seconds", place),
+            subscribe_batch_size=_integer(settings, "subscribe_batch_size", place),
         ),
     )
 

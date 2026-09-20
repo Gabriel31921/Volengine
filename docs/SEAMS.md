@@ -147,6 +147,32 @@ close naturally in a later phase.
   `SurfaceEvaluationError`.
 - **`implied_vol_grid` raises `SurfaceEvaluationError` when a legal but subnormal tenor overflows
   the division**, which blames the model for what is arguably the caller's axis.
+- **The torch learner has no TOML home and is not in `default_adapters`.** `TorchFitSettings`,
+  `NetworkSpec` and the penalty mesh are constructor arguments with working defaults, and
+  `mlp-torch` is reachable from Python and from the contract harness but not from a configuration
+  file -- the same condition `svi-jax` has been in since F3-A, for the same reason: F3-D stayed
+  inside the adapter module `Implementation.md` names for it. Wiring it is a larger change than
+  the JAX one, because the producer runs a different use case (`TrainOnSnapshot`, with a replay
+  buffer, a gate, a schedule and a seed of its own) and the composition root's `_Producer` holds a
+  `CalibrateOnSnapshot`; see the Entrypoints entry below.
+- **The soft tier is a preference and the tests say so with their tolerances.** On the synthetic
+  chain -- whose total variance is *flat* across its two tenors, so any fitting noise is a
+  crossing -- the shipped learner leaves a calendar excess of order `1e-5` in the extrapolated
+  wings of the gate's mesh, and the session's small test network leaves `1e-4`. The tests gate at
+  `1e-4` and call it `GENEROUS_GATE`. A gate at exactly zero would assert the guarantee ADR-010
+  says the soft tier does not give; what a deployment tolerates is the configuration the previous
+  item says does not exist yet.
+- **`TorchSurface.version` resets to `1` on every cold start**, where `LearnedSurface.version`'s
+  docstring says "monotone counter". Both are true within a lineage and cannot both be true across
+  a restart: `update(None, ...)` receives no history to continue the count from, and ADR-019 is
+  the reason it receives none. `producer_meta["weights_version"]` dropping to `1.0` is therefore
+  what a scheduled restart looks like downstream, which is informative, and it is also the only
+  place the restart is visible in the published contract.
+- **The Durrleman stencil exists twice inside one context.** `invariants.durrleman_g` is numpy
+  and judges; `torch_learner._durrleman_g` is torch and trains. The domain's cannot be used in a
+  loss and the adapter's cannot be imported by the domain (rule 3), so
+  `test_the_torch_durrleman_agrees_with_the_domain` holds them together at `1e-12` and a change to
+  one is a change to both. The same shape as the JAX Black-76 against the kernel.
 
 ## Risk
 
@@ -224,12 +250,20 @@ close naturally in a later phase.
   `Mapping[str, Any]` handed to the factory, was refused because it moves parsing into
   `*/adapters/` and takes the table name out of the message.
 - **Neural Surface is not wired into the pipeline.** `build_pipeline` runs Market Data to
-  Parametric Pricing to Risk; `TrainOnSnapshot` is built and tested but nothing constructs one,
-  and `AppConfig` has no section for the replay buffer, the arbitrage mesh, the gate thresholds,
-  the restart schedule or the seed it would need. Deliberate: its learner is torch, an optional
-  extra that arrives in F3-C, and five thresholds nothing in this build can exercise would be
-  five numbers chosen by guesswork. `--calibrators` therefore selects among parametric producers
-  only, which is why its help line does not repeat Design 8.1's `svi,neural` example.
+  Parametric Pricing to Risk; `TrainOnSnapshot` is built and tested, and since F3-D its learner
+  exists (`neural_surface/adapters/torch_learner.py`, exercised through the use case in
+  `tests/neural_surface/test_torch_learner.py`), but nothing constructs one in the composition
+  root and `AppConfig` has no section for the replay buffer, the arbitrage mesh, the gate
+  thresholds, the restart schedule, the learner's own settings or the seed it would need. F3-D
+  left it that way on purpose rather than by omission: the wiring is a composition-root change
+  (`_Producer` holds a `CalibrateOnSnapshot`, `Adapters` has no `learners` mapping, and a lazily
+  importing factory for an optional extra is the same question `svi-jax` has been waiting on),
+  and the numbers those sections would carry are now measurable rather than guessed -- the
+  defaults in `TorchFitSettings` are argued against the synthetic chain -- but they have not yet
+  met the real recorded fixture. Whoever wires it should wire `svi-jax` in the same move, since
+  the factory shape is the same; F3-E's `CompositeSurfaceProvider` is the consumer that makes two
+  producers on one market worth having. `--calibrators` therefore still selects among parametric
+  producers only, which is why its help line does not repeat Design 8.1's `svi,neural` example.
 - **The shipped examples' position expiries are fixed instants (2027-06-25) that will rot.** Both
   `examples/walking-skeleton.toml` and `examples/synthetic-svi.toml` carry one. TOML has no "N
   months from now" literal, while the feeds' tenors are relative to start-up, so a file can only

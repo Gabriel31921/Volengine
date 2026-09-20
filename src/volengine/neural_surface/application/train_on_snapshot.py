@@ -30,6 +30,7 @@ from volengine.contracts.calibrated_surface import SurfaceStatus
 from volengine.contracts.events import Event
 from volengine.contracts.market_snapshot import MarketSnapshot
 from volengine.neural_surface.application.acl import (
+    BASIS_POINTS_PER_UNIT,
     Weighting,
     as_stale_republish,
     fit_metrics,
@@ -43,6 +44,7 @@ from volengine.neural_surface.application.grid_spec import GridSpec
 from volengine.neural_surface.application.training_state import TrainingState
 from volengine.neural_surface.domain.errors import EmptyBufferError, NeuralSurfaceError
 from volengine.neural_surface.domain.invariants import ArbitrageMesh, check_surface
+from volengine.neural_surface.domain.learned_surface import LearnedSurface, implied_vol_grid
 from volengine.neural_surface.domain.ports import Clock, MetricsSink, SurfaceLearner
 from volengine.neural_surface.domain.replay_buffer import ReplayBuffer
 from volengine.neural_surface.domain.training_batch import TrainingBatch, TrainingSample
@@ -123,6 +125,30 @@ class TrainingSchedule:
             )
 
 
+def _drift_vol_bp(before: LearnedSurface, after: LearnedSurface, mesh: ArbitrageMesh) -> float:
+    """How far continuous fine-tuning had wandered from a fit made from scratch, in vol bp.
+
+    The honest drift measurement of Design 6.4: the root-mean-square difference in implied
+    volatility between the surface fine-tuning arrived at and the one the restart retrained over
+    the whole buffer, on the gate's mesh. Both surfaces are evaluable and both exist at the same
+    instant, which is exactly what ADR-019 bought by making the restart ``update(None, ...)`` on a
+    learner that never retrains in place. Measured on the mesh rather than on the batch because
+    the question is about the *surface* -- including the wings the fresh quotes never visit --
+    and stated in basis points of volatility because that is the unit every other error in the
+    contract is stated in.
+
+    A large value says accumulated fine-tuning error, a market that moved between restarts, or
+    both; the metric does not distinguish them, and it is not meant to. What it gives an operator
+    is the number to watch: a drift that grows restart over restart is the fine-tuning failing
+    slowly, which is the accepted risk of Design 11.4 made visible before a volatile session
+    makes it obvious.
+    """
+    k = mesh.k_array
+    tenors = mesh.tenor_array
+    difference = implied_vol_grid(after, k, tenors) - implied_vol_grid(before, k, tenors)
+    return float(np.sqrt(np.mean(difference * difference))) * BASIS_POINTS_PER_UNIT
+
+
 class TrainOnSnapshot:
     """Fine-tune on one snapshot and say what happened, in the published language.
 
@@ -196,6 +222,8 @@ class TrainOnSnapshot:
            buffer and ``previous`` is ``None``: the same operation without a history.
         5. **Train**, and time it on the injected clock.
         6. **Judge**, on the mesh, against the tolerances. A surface over either one is refused.
+           On a restart, also **measure the drift**: the distance on that mesh between the surface
+           fine-tuning had arrived at and the one retrained from scratch (Design 6.4).
         7. **Publish**, or refuse and republish the last good surface (ADR-006).
 
         Returns:
@@ -228,16 +256,17 @@ class TrainOnSnapshot:
         if batch is None:
             return self._refuse(snapshot, "the batch carried no usable weight")
 
+        # Held before `trained()` overwrites it: on a restart this is the "before" of the
+        # before-and-after comparison, and it is the reason `update` takes `previous` as an
+        # argument rather than retraining in place (ADR-019) -- both surfaces have to exist at
+        # the same time for the drift to be measurable at all.
+        before = self._state.surface
         started = self._clock.now()
         try:
-            surface = self._learner.update(None if restarting else self._state.surface, batch)
+            surface = self._learner.update(None if restarting else before, batch)
         except NeuralSurfaceError as failure:
             return self._refuse(snapshot, str(failure))
         finished = self._clock.now()
-
-        if restarting:
-            self._state.restarted(now)
-            self._metrics.counter("neural.restart", market=snapshot.market_id)
 
         report = check_surface(surface, self._mesh)
         self._metrics.gauge(
@@ -246,6 +275,19 @@ class TrainOnSnapshot:
         self._metrics.gauge(
             "neural.calendar_violation", report.calendar_violation, market=snapshot.market_id
         )
+
+        if restarting:
+            self._state.restarted(now)
+            self._metrics.counter("neural.restart", market=snapshot.market_id)
+            # The first cycle never restarts (`TrainingState.is_restart_due`), so there is always
+            # a surface to measure against here; the guard is for the type, not for a case.
+            if before is not None:
+                self._metrics.gauge(
+                    "neural.restart.drift_vol_bp",
+                    _drift_vol_bp(before, surface, self._mesh),
+                    market=snapshot.market_id,
+                    producer=self._learner.producer_id,
+                )
 
         # The surface is kept even when it is refused. It is the state fine-tuning continues from,
         # and throwing it away on a failed gate would turn every refusal into a cold restart --

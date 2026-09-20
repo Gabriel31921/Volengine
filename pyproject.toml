@@ -32,6 +32,19 @@ dev = [
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+# The `neural` extra resolves torch from PyTorch's CPU index rather than from PyPI. The PyPI wheel
+# is the CUDA build -- half a gigabyte of torch plus several gigabytes of CUDA libraries -- and
+# nothing in this engine needs a GPU: the learner is an MLP of tens of neurons trained for a
+# handful of steps per snapshot, and CI runs on a CPU runner. `explicit = true` keeps the index
+# from being consulted for anything but torch.
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/volengine"]
 
@@ -70,6 +83,13 @@ ignore_missing_imports = true
 # naming the unchecked libraries, for the same reason the scipy one exists above.
 [[tool.mypy.overrides]]
 module = ["jax.*", "optax.*"]
+ignore_missing_imports = true
+
+# `torch` ships `py.typed`, so on the leg that installs the `neural` extra the learner is checked
+# against its real signatures; on the legs that do not, `neural_surface/adapters/torch_learner.py`
+# imports it at module level and would otherwise be unresolvable. Same shape as the jax entry.
+[[tool.mypy.overrides]]
+module = ["torch.*"]
 ignore_missing_imports = true
 
 # `websockets` and `httpx` both ship `py.typed`, so with the `deribit` extra installed the Deribit

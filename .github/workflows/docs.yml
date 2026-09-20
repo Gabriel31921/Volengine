@@ -31,12 +31,12 @@ jobs:
 
       # Installs the Python pinned by requires-python and the locked dependencies.
       # pdoc imports the package to read its docstrings, so every module that is
-      # imported unconditionally needs its dependency present. The jax extra is one
-      # of those: parametric_pricing/adapters/jax_*.py import jax at module level,
-      # so it has to be installed here even though it stays an optional extra for
-      # a normal install. torch stays out until an adapter actually imports it.
+      # imported unconditionally needs its dependency present. Both extras are:
+      # parametric_pricing/adapters/jax_*.py import jax at module level and
+      # neural_surface/adapters/torch_learner.py imports torch, so both have to be
+      # installed here even though they stay optional for a normal install.
       - name: Sync the environment
-        run: uv sync --frozen --extra jax
+        run: uv sync --frozen --extra jax --extra neural
 
       - name: Build the docs
         run: >

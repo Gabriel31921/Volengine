@@ -19,6 +19,18 @@ implementer needs a test body changed to pass, the port has grown a second meani
 finding, not the failure. F3-A's JAX calibrator joined exactly that way, and the only thing that
 was not one line is that it arrives with an optional extra -- so the entry is conditional and the
 set is one shorter on a machine that installed no JAX.
+
+**F3-D's neural producer is the finding that sentence anticipated, and it is recorded here.** The
+learner is not behind ``Calibrator`` at all: ADR-019 made it the same function with different
+mathematics -- ``update(previous, batch)`` beside ``calibrate(previous, task)`` -- but the input is
+a point cloud rather than a stack of slices, so the three tests below that speak of slices, tasks
+and warm-start parameters have no meaning for it. What the plan's claim is actually about is
+**interchangeability for Risk**, and that is a statement about ``CalibratedSurface``, not about
+either port. So the module now has two populations: :data:`CALIBRATORS`, the implementers of the
+``Calibrator`` port, over which the port-shaped tests run unchanged; and :data:`PRODUCERS`, every
+route this build has from a ``MarketSnapshot`` to a ``CalibratedSurface``, over which the two
+Risk-facing tests run. The neural producer is one entry in the second, conditional on its extra
+like the JAX one is on its own, and no test body branches on which kind of producer it was given.
 """
 
 from __future__ import annotations
@@ -38,6 +50,7 @@ from tests.parametric_pricing.builders import (
 )
 from tests.risk.builders import make_bumps
 from volengine.contracts.calibrated_surface import CalibratedSurface, SurfaceStatus
+from volengine.contracts.market_snapshot import MarketSnapshot
 from volengine.parametric_pricing.adapters.flat_vol import FlatVolCalibrator
 from volengine.parametric_pricing.adapters.scipy_calibrator import ScipyCalibrator
 from volengine.parametric_pricing.application.acl import to_calibrated_surface, to_calibration_task
@@ -69,7 +82,8 @@ def _implementers() -> tuple[Callable[[], Calibrator], ...]:
 CALIBRATORS: tuple[Callable[[], Calibrator], ...] = _implementers()
 """Every implementer of the port this build can construct, as zero-argument factories.
 
-Three with the JAX extra installed, two without, and one more when F3-D lands its learner. A
+Three with the JAX extra installed, two without. The neural learner is deliberately *not* one of
+them -- it is behind a different port, and it joins :data:`PRODUCERS` below instead. A
 factory rather than an instance so that each test gets a calibrator that has never been called:
 warm-start state is the one thing a calibrator is allowed to keep between cycles, and a shared
 instance would let one test's history decide another test's answer.
@@ -78,27 +92,53 @@ instance would let one test's history decide another test's answer.
 IDS = tuple(factory.__name__ for factory in CALIBRATORS)
 """Test ids that name the class, so a failure says which implementer broke the contract."""
 
+Producer = Callable[[MarketSnapshot], CalibratedSurface]
+"""A route from a published snapshot to a published surface, whatever runs in between."""
 
-def task() -> CalibrationTask:
+
+def _producers() -> tuple[tuple[str, Producer], ...]:
+    """Every route this *installation* has from a snapshot to a ``CalibratedSurface``.
+
+    One per calibrator, each wrapped in the translation :func:`published` performs, plus the
+    neural learner through its own ACL when the ``neural`` extra is installed. The torch builder is
+    imported inside the guard for the same reason the JAX one is above.
+    """
+    producers: list[tuple[str, Producer]] = [
+        (name, _through_calibrator(build)) for name, build in zip(IDS, CALIBRATORS, strict=True)
+    ]
+    if find_spec("torch") is not None:
+        from tests.neural_surface.torch_builders import publish_through_learner
+
+        producers.append(("TorchLearner", publish_through_learner))
+    return tuple(producers)
+
+
+def _through_calibrator(build: Callable[[], Calibrator]) -> Producer:
+    return lambda snapshot: published(build(), snapshot)
+
+
+def task(snapshot: MarketSnapshot | None = None) -> CalibrationTask:
     """One published snapshot, translated into the problem every implementer is handed.
 
     Built through the real ACL rather than assembled by hand: the contract is about what a
     calibrator receives *in the engine*, and a task written directly in the test could be one no
     inversion would ever produce.
     """
-    translated = to_calibration_task(make_market_snapshot(), make_weighting())
+    translated = to_calibration_task(
+        make_market_snapshot() if snapshot is None else snapshot, make_weighting()
+    )
     assert translated is not None, "the builder's snapshot must produce a fittable task"
     return translated
 
 
-def published(calibrator: Calibrator) -> CalibratedSurface:
+def published(calibrator: Calibrator, snapshot: MarketSnapshot | None = None) -> CalibratedSurface:
     """Fit the task and publish the whole result, exactly as the use case would.
 
     Every slice is accepted here. Acceptance is the use case's judgement and it is tested there;
     what this module needs is the translation, which must work for whatever the fit came back
     with.
     """
-    fitted = task()
+    fitted = task(snapshot)
     result = calibrator.calibrate(None, fitted)
     surface = to_calibrated_surface(
         task=fitted,
@@ -113,6 +153,17 @@ def published(calibrator: Calibrator) -> CalibratedSurface:
     )
     assert surface is not None, "an accepted fit must be expressible on the published grid"
     return surface
+
+
+PRODUCERS: tuple[tuple[str, Producer], ...] = _producers()
+"""Every producer of a ``CalibratedSurface`` this build can construct, named.
+
+The calibrators above plus the neural learner: four with both extras installed, two with neither.
+Named tuples rather than bare callables because a lambda has no ``__name__`` worth printing.
+"""
+
+PRODUCER_IDS = tuple(name for name, _ in PRODUCERS)
+PRODUCER_ROUTES = tuple(route for _, route in PRODUCERS)
 
 
 @pytest.mark.parametrize("build", CALIBRATORS, ids=IDS)
@@ -180,18 +231,18 @@ def test_a_warm_start_is_accepted_and_still_answers_for_every_slice(
     assert len(warmed.slices) == len(fitted.slices)
 
 
-@pytest.mark.parametrize("build", CALIBRATORS, ids=IDS)
-def test_what_it_fitted_publishes_as_a_surface_a_risk_report_can_value(
-    build: Callable[[], Calibrator],
-) -> None:
-    """The whole point of the port: a position is valued without knowing who fitted the surface.
+@pytest.mark.parametrize("produce", PRODUCER_ROUTES, ids=PRODUCER_IDS)
+def test_what_it_fitted_publishes_as_a_surface_a_risk_report_can_value(produce: Producer) -> None:
+    """The whole point of the contract: a position is valued without knowing who fitted the surface.
 
-    Snapshot to task to fit to ``CalibratedSurface`` to ``SurfaceView`` to one report line, with
-    no branch anywhere on the producer. The bounds are deliberately loose -- this asserts that a
-    number came out and that it is a volatility rather than a NaN, which is a statement about the
-    wiring; how *good* the number is belongs to the implementer's own tests.
+    Snapshot to fit to ``CalibratedSurface`` to ``SurfaceView`` to one report line, with no branch
+    anywhere on the producer -- and over every producer, the neural one included, because this is
+    the claim that does not care which port the surface came through. The bounds are deliberately
+    loose -- this asserts that a number came out and that it is a volatility rather than a NaN,
+    which is a statement about the wiring; how *good* the number is belongs to the implementer's
+    own tests.
     """
-    surface = published(build())
+    surface = produce(make_market_snapshot())
 
     line = position_risk(
         view=to_surface_view(surface),
@@ -217,9 +268,11 @@ def test_every_implementer_publishes_the_same_axes_for_the_same_snapshot() -> No
     this project exists to make would be comparing the interpolation as much as the fit.
 
     Not parametrised: the claim is about the implementers *against each other*, which is exactly
-    the assertion no single-implementer run can make.
+    the assertion no single-implementer run can make. Over every producer, so that the neural
+    surface -- which could answer on any axis it liked, having no slices -- is held to the
+    parametric ones' coordinate system.
     """
-    surfaces = [published(build()) for build in CALIBRATORS]
+    surfaces = [produce(make_market_snapshot()) for produce in PRODUCER_ROUTES]
 
     axes = {(one.grid.log_moneyness, one.grid.tenors, one.grid.expiries) for one in surfaces}
     assert len(axes) == 1

@@ -21,11 +21,12 @@ jobs:
   verify:
     runs-on: ubuntu-latest
 
-    # Two legs of the same gate, which is the shape ADR-024 said this workflow would grow when a
-    # calibrator first needed an optional extra — F3-A's JAX one did. The bare leg is the promise
-    # that the engine runs with numpy and scipy alone: the JAX test modules are not collected there
-    # (tests/parametric_pricing/conftest.py) and the contract harness runs one implementer fewer.
-    # The `jax` leg is the only place that code is exercised at all, so both have to pass.
+    # Three legs of the same gate, which is the shape ADR-024 said this workflow would grow when a
+    # producer first needed an optional extra — F3-A's JAX calibrator did, and F3-D's torch learner
+    # is the second. The bare leg is the promise that the engine runs with numpy and scipy alone:
+    # the JAX and torch test modules are not collected there (the two contexts' conftest.py) and
+    # the contract harness runs with fewer producers. Each extra's leg is the only place that code
+    # is exercised at all, so all three have to pass.
     #
     # fail-fast is off: when one leg breaks, which one is the finding.
     strategy:
@@ -36,6 +37,8 @@ jobs:
             extras: ""
           - name: with jax
             extras: "--extra jax"
+          - name: with neural
+            extras: "--extra neural"
 
     name: verify (${{ matrix.name }})
 
@@ -49,8 +52,9 @@ jobs:
 
       # Installs the Python pinned by requires-python and the locked dev environment: pytest,
       # hypothesis, ruff, mypy and import-linter on top of numpy, scipy and typer, plus whatever
-      # this leg's extra adds. torch is still an optional extra nothing here installs; the domain
-      # is forbidden from importing any of them by an import-linter contract.
+      # this leg's extra adds. torch resolves from PyTorch's CPU index (pyproject.toml), not the
+      # CUDA build on PyPI; the domain is forbidden from importing any extra by an import-linter
+      # contract.
       #
       # --frozen: the lockfile is used as committed. A pyproject.toml edited without re-locking
       # fails here instead of resolving to something no developer has run.

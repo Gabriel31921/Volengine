@@ -367,6 +367,43 @@ def test_a_restart_is_counted() -> None:
     assert "neural.restart" in metrics.counter_names()
 
 
+def test_a_restart_gauges_the_drift_between_the_surface_it_replaces_and_the_one_it_made() -> None:
+    """Design 6.4's before-and-after comparison, as a number an operator can watch.
+
+    Two flat surfaces five vol points apart differ by exactly 500 basis points at every mesh node,
+    so the root-mean-square distance is 500 on the nose and the assertion needs no tolerance.
+    """
+    clock = ManualClock(NOW)
+    use_case, learner, _, _, metrics = make_use_case(
+        clock=clock, schedule=make_schedule(restart_seconds=600.0), buffer=patient_buffer()
+    )
+    use_case.handle(make_market_snapshot())
+    learner.answer_with(FlatVolSurface(vol=0.70))
+
+    clock.advance(700.0)
+    use_case.handle(later_snapshot())
+
+    assert metrics.gauge_value("neural.restart.drift_vol_bp") == pytest.approx(500.0)
+
+
+def test_the_drift_is_gauged_only_on_a_restart() -> None:
+    """A warm step that moved the surface is fine-tuning doing its job, not drift: the same change
+    on an ordinary cycle must leave the gauge unemitted, or the series would say nothing."""
+    clock = ManualClock(NOW)
+    use_case, learner, _, _, metrics = make_use_case(
+        clock=clock, schedule=make_schedule(restart_seconds=600.0), buffer=patient_buffer()
+    )
+    use_case.handle(make_market_snapshot())
+    learner.answer_with(FlatVolSurface(vol=0.70))
+
+    clock.advance(100.0)
+    use_case.handle(later_snapshot(seconds=100.0))
+
+    assert "neural.restart" not in metrics.counter_names()
+    with pytest.raises(KeyError, match="drift_vol_bp"):
+        metrics.gauge_value("neural.restart.drift_vol_bp")
+
+
 def test_a_restart_interval_longer_than_the_age_horizon_has_nothing_to_retrain_on() -> None:
     """Two configured numbers interacting, pinned so the interaction is a decision and not a bug.
 

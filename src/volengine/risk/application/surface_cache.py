@@ -17,13 +17,25 @@ from the second-newest would answer a question about a market that has moved. No
 for a republished stale surface -- it overwrites the fresh one it is standing in for, because it
 *is* the newest thing the producer has said, and the report's freshness verdict is computed from
 its timestamp rather than from how it got here.
+
+**It is also where the latency of every producer is measured** (Design 8.3, F3-E). Every surface
+of every producer passes through :meth:`LastValueSurfaceProvider.accept`, and this is the one
+place in the engine that sees them all on arrival -- so "snapshot to surface, per producer" and
+the conflation lag of the hop that delivered it are measured here, from the two instants the
+contract carries and the consumer's own clock, rather than once per producer in two contexts that
+would have to agree on a name.
 """
 
 from __future__ import annotations
 
-from volengine.contracts.calibrated_surface import CalibratedSurface
+from datetime import timedelta
+
+from volengine.contracts.calibrated_surface import CalibratedSurface, SurfaceStatus
 from volengine.risk.application.acl import to_surface_view
+from volengine.risk.domain.ports import Clock, MetricsSink
 from volengine.risk.domain.surface_view import SurfaceView
+
+MILLISECONDS_PER_SECOND = 1_000.0
 
 
 class LastValueSurfaceProvider:
@@ -36,7 +48,16 @@ class LastValueSurfaceProvider:
     the bus and read from the same loop when a report is computed.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, clock: Clock, metrics: MetricsSink) -> None:
+        """Wire the cache to the clock it measures arrival against and the sink it reports to.
+
+        Args:
+            clock: Read once per accepted surface, for the delivery lag. The engine's own clock
+                (ADR-004), so a replay measures recorded time.
+            metrics: Where the per-producer latencies go.
+        """
+        self._clock = clock
+        self._metrics = metrics
         self._by_market: dict[str, dict[str, SurfaceView]] = {}
 
     def accept(self, surface: CalibratedSurface) -> None:
@@ -54,7 +75,47 @@ class LastValueSurfaceProvider:
                 built to make impossible.
         """
         view = to_surface_view(surface)
+        self._observe(surface)
         self._by_market.setdefault(view.market_id, {})[view.producer_id] = view
+
+    def _observe(self, surface: CalibratedSurface) -> None:
+        """Count the arrival, and time the two hops behind it unless it is a republication.
+
+        Three series, tagged by market and producer:
+
+        * ``risk.surface.received``, with the ``status`` as a tag. The share of
+          ``STALE_REPUBLISH`` among them is the failure rate of a producer as Risk lives it --
+          ADR-006 turns every refused fit with a surface behind it into one of these.
+        * ``risk.surface.snapshot_to_surface_ms``, ``ts_calibrated - ts_snapshot``: the snapshot
+          to surface latency of Design 8.3. It includes the time the snapshot waited in a
+          conflating mailbox for a busy calibrator, which is the point -- ``pricing.cycle_ms`` is
+          the fit alone, and the gap between the two series is the queueing.
+        * ``risk.surface.delivery_lag_ms``, ``now - ts_calibrated``: from the producer stamping
+          its result to this consumer taking it. On one process that is the bus hop and the event
+          loop's backlog, which is the conflation lag Design 8.3 names. Signed and not clamped,
+          for the reason ``ComputeReportUseCase._stamp`` keeps a negative age visible.
+
+        **A republished surface is counted and not timed.** ADR-006 republishes the last good
+        surface with *both* of its original instants (``as_stale_republish`` replaces only the
+        status), so its snapshot-to-surface latency is the old fit's again and its delivery lag
+        is the age of that fit -- a staleness, and already measured as one by the report. Timing
+        it would add a spike per failure to a latency series that should not move when a fit is
+        refused.
+        """
+        tags = {"market": surface.market_id, "producer": surface.producer_id}
+        self._metrics.counter("risk.surface.received", 1, status=surface.status.value, **tags)
+        if surface.status is SurfaceStatus.STALE_REPUBLISH:
+            return
+        self._metrics.timing(
+            "risk.surface.snapshot_to_surface_ms",
+            _milliseconds(surface.ts_calibrated - surface.ts_snapshot),
+            **tags,
+        )
+        self._metrics.timing(
+            "risk.surface.delivery_lag_ms",
+            _milliseconds(self._clock.now() - surface.ts_calibrated),
+            **tags,
+        )
 
     def latest(self, market_id: str) -> SurfaceView | None:
         """The newest surface held for this market, or ``None``.
@@ -91,3 +152,38 @@ class LastValueSurfaceProvider:
         is the moment a rule can branch on one.
         """
         return self._by_market.get(market_id, {}).get(producer_id)
+
+
+class ProducerSurfaces:
+    """One named producer's slot in a shared cache, seen as a ``SurfaceProvider``.
+
+    The binding Design 7.3 needs. :meth:`LastValueSurfaceProvider.latest` picks the newest surface
+    across every producer, which is the right answer to the question the port asks and the wrong
+    one for a report that must be *about* one producer: valuing one book under two producers
+    means asking for a named one twice. That is ``for_producer``, deliberately not on the port --
+    so this adapter pins the name and answers the port's question with it, and the use case on
+    the other side never learns that producers can be named.
+
+    Moved here from the composition root in F3-E, where it was private: the comparative report
+    (``compare_producers.py``) needs the same binding and an application module cannot import from
+    ``entrypoints/``.
+    """
+
+    def __init__(self, cache: LastValueSurfaceProvider, producer_id: str) -> None:
+        """Pin one producer.
+
+        Raises:
+            ValueError: If ``producer_id`` is empty, which would pin a slot nothing can fill.
+        """
+        if not producer_id:
+            raise ValueError("A producer slot must name its producer")
+        self._cache = cache
+        self._producer_id = producer_id
+
+    def latest(self, market_id: str) -> SurfaceView | None:
+        """The pinned producer's newest surface for this market, or ``None``."""
+        return self._cache.for_producer(market_id, self._producer_id)
+
+
+def _milliseconds(elapsed: timedelta) -> float:
+    return elapsed.total_seconds() * MILLISECONDS_PER_SECOND

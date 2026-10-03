@@ -123,11 +123,11 @@ from volengine.platform.metrics import MetricsSink
 from volengine.platform.runner import BusRunner, EventHandler
 from volengine.risk.adapters.console_report_writer import ConsoleReportWriter
 from volengine.risk.adapters.csv_report_writer import CsvReportWriter
+from volengine.risk.application.compare_producers import CompareProducersUseCase
 from volengine.risk.application.compute_report import ComputeReportUseCase
-from volengine.risk.application.surface_cache import LastValueSurfaceProvider
+from volengine.risk.application.surface_cache import LastValueSurfaceProvider, ProducerSurfaces
 from volengine.risk.domain.portfolio import Portfolio
 from volengine.risk.domain.ports import ReportWriter
-from volengine.risk.domain.surface_view import SurfaceView
 
 type ProviderFactory = Callable[[MarketConfig], MarketDataProvider]
 """Builds one market's quote source from its configuration."""
@@ -436,23 +436,12 @@ class _Producer:
     executor: Executor
 
 
-class _ProducerSurfaces:
-    """One named producer's slot in the shared cache, seen as a ``SurfaceProvider``.
+@dataclass(frozen=True, slots=True)
+class _Comparison:
+    """Two producers on one market, compared each time either of them publishes (Design 7.3)."""
 
-    The composition root's answer to Design 7.3. ``LastValueSurfaceProvider.latest`` picks the
-    newest surface across every producer, which is the right answer to the question the port asks
-    and the wrong one for a comparative report: valuing one book under two producers means asking
-    for a *named* one twice. That is ``for_producer``, which is deliberately not on the port -- so
-    the binding from "the surface for this market" to "this producer's surface for this market"
-    happens here, in the only layer allowed to know that two producers exist at once.
-    """
-
-    def __init__(self, cache: LastValueSurfaceProvider, producer_id: str) -> None:
-        self._cache = cache
-        self._producer_id = producer_id
-
-    def latest(self, market_id: str) -> SurfaceView | None:
-        return self._cache.for_producer(market_id, self._producer_id)
+    market_id: str
+    compare: CompareProducersUseCase
 
 
 def build_pipeline(
@@ -488,12 +477,13 @@ def build_pipeline(
             :func:`_book_for`.
     """
     executors = NamedExecutors()
-    cache = LastValueSurfaceProvider()
+    cache = LastValueSurfaceProvider(clock=clock, metrics=metrics)
     writer = _lookup(adapters.writers, config.risk.writer, "writer")(config.risk)
     _require_every_position_is_quoted(config)
 
     markets: list[_MarketLoop] = []
     producers: list[_Producer] = []
+    comparisons: list[_Comparison] = []
     for market in config.markets:
         book = _book_for(market, config.risk.portfolio)
         chain = QuoteChain(market.conventions, market.admissibility)
@@ -543,7 +533,7 @@ def build_pipeline(
                         acceptance=config.calibration.acceptance,
                     ),
                     report=ComputeReportUseCase(
-                        provider=_ProducerSurfaces(cache, producer_id),
+                        provider=ProducerSurfaces(cache, producer_id),
                         portfolio=book,
                         policy=config.risk.freshness,
                         clock=clock,
@@ -562,16 +552,66 @@ def build_pipeline(
                 )
             )
 
+        comparisons.extend(
+            _comparisons_for(market.market_id, producers, cache, book, config, clock, metrics)
+        )
+
     return Pipeline(
         bus=bus,
         clock=clock,
         metrics=metrics,
         markets=tuple(markets),
         producers=tuple(producers),
+        comparisons=tuple(comparisons),
         cache=cache,
         writer=writer,
         executors=executors,
     )
+
+
+def _comparisons_for(
+    market_id: str,
+    producers: Sequence[_Producer],
+    cache: LastValueSurfaceProvider,
+    book: Portfolio,
+    config: AppConfig,
+    clock: Clock,
+    metrics: MetricsSink,
+) -> list[_Comparison]:
+    """One comparison per extra producer on this market, each measured against the first.
+
+    **The first calibrator the configuration lists is the baseline**, and every other producer on
+    the market is a challenger measured from it. That is the arrangement Design 7.3 describes --
+    a reference surface and the alternatives judged against it -- and taking it from the order of
+    ``calibrators`` keeps it a configuration choice rather than a rule about producer names. A
+    market with one producer gets no comparison, and a producer listed twice is not compared with
+    itself.
+
+    The comparison writes no report. Its output is the metric set of Design 8.3 that no single
+    report can produce -- ``risk.comparison.distance_*`` and ``risk.comparison.value_diff`` --
+    while the per-producer reports go to the writer as before. A writer for the
+    ``ComparativeReport`` shape is a separate gap (``docs/SEAMS.md``, Risk).
+    """
+    ids = list(dict.fromkeys(p.producer_id for p in producers if p.market_id == market_id))
+    if len(ids) < 2:
+        return []
+    baseline, *challengers = ids
+    return [
+        _Comparison(
+            market_id=market_id,
+            compare=CompareProducersUseCase(
+                cache=cache,
+                portfolio=book,
+                policy=config.risk.freshness,
+                clock=clock,
+                metrics=metrics,
+                settings=config.risk.settings,
+                baseline_producer_id=baseline,
+                challenger_producer_id=challenger,
+            ),
+        )
+        for challenger in challengers
+    ]
 
 
 def _book_for(market: MarketConfig, portfolio: Portfolio) -> Portfolio:
@@ -651,6 +691,7 @@ class Pipeline:
         metrics: MetricsSink,
         markets: tuple[_MarketLoop, ...],
         producers: tuple[_Producer, ...],
+        comparisons: tuple[_Comparison, ...],
         cache: LastValueSurfaceProvider,
         writer: ReportWriter,
         executors: NamedExecutors,
@@ -660,6 +701,7 @@ class Pipeline:
         self._metrics = metrics
         self._markets = markets
         self._producers = producers
+        self._comparisons = comparisons
         self._cache = cache
         self._writer = writer
         self._executors = executors
@@ -937,7 +979,7 @@ class Pipeline:
         return handle
 
     def _report_handler(self, producer: _Producer) -> EventHandler:
-        """Cache the surface, value the book against it, and write the result.
+        """Cache the surface, compare the producers on its market, value the book, write the result.
 
         On the event loop rather than on a pool, unlike the calibration above. The cache is shared
         by every producer and documents itself as single-threaded; a report is one interpolation
@@ -961,12 +1003,26 @@ class Pipeline:
             if not isinstance(event, SurfaceCalibrated):
                 return
             self._cache.accept(event.surface)
+            self._compare(producer.market_id)
             if self._goal_met():
                 return
             self._writer.write(producer.report.compute(producer.market_id))
             self._count_report()
 
         return handle
+
+    def _compare(self, market_id: str) -> None:
+        """Run every comparison on this market against what the cache now holds.
+
+        Before the goal check, unlike the report: it writes nothing, so it cannot overshoot a
+        ``--count``, and the distance between producers is a series that should not stop being
+        measured because the operator asked for one report. Its two inner reports emit the usual
+        ``risk.report.*`` series as well, tagged by producer; a reader counting reports per
+        producer counts the writer's rows, not those.
+        """
+        for comparison in self._comparisons:
+            if comparison.market_id == market_id:
+                comparison.compare.compute(market_id)
 
     # --- plumbing
 

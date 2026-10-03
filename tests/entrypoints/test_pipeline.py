@@ -257,6 +257,42 @@ async def test_each_producer_reports_off_its_own_surface() -> None:
     assert {report.producer_id for report in writer.reports} == {"svi-a", "svi-b"}
 
 
+async def test_two_producers_on_one_market_are_compared_in_a_running_pipeline() -> None:
+    """Design 7.3 and 8.3: the distance between producers is measured by the engine, not a test."""
+    _, metrics, pipeline = make_pipeline(
+        StubProvider(updates=two_sided(), instruments=one_instrument()),
+        calibrators={
+            "svi-a": StubCalibrator(producer_id="svi-a"),
+            "svi-b": StubCalibrator(producer_id="svi-b"),
+        },
+    )
+
+    await pipeline.run()
+
+    distances = [
+        tags for name, _, tags in metrics.gauges if name == "risk.comparison.distance_rms_vol_bp"
+    ]
+    assert distances
+    assert all(
+        tags == {"market": tags["market"], "baseline": "svi-a", "challenger": "svi-b"}
+        for tags in distances
+    )
+    # Two stubs fitting one snapshot identically: the control value, exactly zero.
+    assert metrics.gauge_value("risk.comparison.distance_rms_vol_bp") == 0.0
+
+
+async def test_a_market_with_one_producer_runs_no_comparison() -> None:
+    """The guard on the test above: the comparison series comes from the second producer."""
+    _, metrics, pipeline = make_pipeline(
+        StubProvider(updates=two_sided(), instruments=one_instrument())
+    )
+
+    await pipeline.run()
+
+    assert not any(name.startswith("risk.comparison.") for name, _, _ in metrics.gauges)
+    assert not any(name.startswith("risk.comparison.") for name in metrics.counter_names())
+
+
 async def test_the_provider_is_closed_when_the_run_ends() -> None:
     provider = StubProvider(updates=two_sided(), instruments=one_instrument())
     _, _, pipeline = make_pipeline(provider)

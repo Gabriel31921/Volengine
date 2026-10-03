@@ -200,6 +200,24 @@ close naturally in a later phase.
 - **Risk's numerical greeks carry the grid's kinks** as well as the bump's truncation error. The
   at-the-money gamma of the test surface is about twice the analytic value — a fact Design §7.4
   wants visible, not a defect.
+- **The comparative report is measured, not written.** `build_pipeline` runs a
+  `CompareProducersUseCase` whenever a market has two or more producers -- the first configured
+  calibrator is the baseline, every other one a challenger -- each time a surface arrives, and the
+  `risk.comparison.*` series reach the metrics sink. No `ReportWriter` prints the
+  `ComparativeReport` itself: the writer port takes a `RiskReport`, and a second shape needs a
+  writer of its own. Its two inner reports also emit the usual `risk.report.*` series, so those
+  count comparisons as well as written reports; the writer's rows are the count of reports.
+- **The distance between producers is a box-overlap measure on the two grids.** `surface_distance`
+  compares at every node of either grid that lies inside the other's box, through this context's
+  own bilinear interpolation, at equal *tenor in years*. Two surfaces resting on different
+  snapshots are therefore compared at equal time-to-expiry rather than at equal expiry, and a
+  wing only one producer reaches is not measured at all rather than measured against the clamp.
+  Region-by-region divergence (Design 6.5, "in which region of the surface") is not reported; the
+  number is one RMS and one maximum.
+- **AD greeks against Risk's numerical greeks are not reported.** `Plan.md` puts the comparison
+  under F3-E; it needs `parametric_pricing/adapters/jax_greeks.py` and `risk/domain/valuation.py`
+  side by side, which only `entrypoints/` or `tests/` may import together, and neither a command
+  nor a test that reports the gap exists yet.
 
 ## Entrypoints
 
@@ -261,8 +279,9 @@ close naturally in a later phase.
   and the numbers those sections would carry are now measurable rather than guessed -- the
   defaults in `TorchFitSettings` are argued against the synthetic chain -- but they have not yet
   met the real recorded fixture. Whoever wires it should wire `svi-jax` in the same move, since
-  the factory shape is the same; F3-E's `CompositeSurfaceProvider` is the consumer that makes two
-  producers on one market worth having. `--calibrators` therefore still selects among parametric
+  the factory shape is the same. F3-E's comparative report (`risk/application/compare_producers.py`)
+  already runs for any two configured parametric producers on a market (`flat-vol` and
+  `svi-scipy` today); wiring the neural one is what would make it compare the two engines. `--calibrators` therefore still selects among parametric
   producers only, which is why its help line does not repeat Design 8.1's `svi,neural` example.
 - **The shipped examples' position expiries are fixed instants (2027-06-25) that will rot.** Both
   `examples/walking-skeleton.toml` and `examples/synthetic-svi.toml` carry one. TOML has no "N
@@ -273,6 +292,12 @@ close naturally in a later phase.
   and names registered adapters, never the date. Closing this for good means either a config field
   expressed as an offset from start-up (which the composition root would resolve against
   `SystemClock`) or accepting the periodic bump as the cost of a literal example file.
+- **The CSV metrics sink has no TOML or CLI home.** `platform/adapters/csv_metrics_sink.py` writes
+  every measurement to a file stamped by the engine's clock, and `--metrics` still selects between
+  `LoggingMetricsSink` and the null sink. Selecting it needs a path in the configuration and the
+  composition root owning `close()` -- the port has none, so the run that opens the file has to be
+  the one that ends it. F3-E built the adapter and left the selection to the same composition-root
+  move as the two unreachable producers.
 
 ## Cross-cutting
 

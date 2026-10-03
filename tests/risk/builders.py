@@ -20,12 +20,15 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
+from tests.support import RecordingMetrics
 from volengine.contracts.calibrated_surface import (
     CalibratedSurface,
     FitMetrics,
     SurfaceStatus,
     VolGrid,
 )
+from volengine.platform.clock import ManualClock
+from volengine.risk.application.surface_cache import LastValueSurfaceProvider
 from volengine.risk.domain.freshness_policy import FreshnessDecision, FreshnessPolicy
 from volengine.risk.domain.portfolio import Portfolio, Position
 from volengine.risk.domain.pricing import OptionKindR
@@ -259,3 +262,17 @@ class StubSurfaceProvider:
 
     def latest(self, market_id: str) -> SurfaceView | None:
         return self._view
+
+
+def make_cache(
+    clock: ManualClock | None = None, metrics: RecordingMetrics | None = None
+) -> LastValueSurfaceProvider:
+    """An empty cache on a clock stopped at :data:`NOW`, reporting into a sink nobody reads.
+
+    Both collaborators are optional so that a test about what the cache *holds* says nothing
+    about time or metrics, and a test about what it *measures* passes the two it asserts on.
+    """
+    return LastValueSurfaceProvider(
+        clock=ManualClock(NOW) if clock is None else clock,
+        metrics=RecordingMetrics() if metrics is None else metrics,
+    )

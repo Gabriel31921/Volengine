@@ -531,7 +531,7 @@ min_coverage_ratio = 0.6
 max_quiet_seconds = 30.0
 
 [calibration]
-calibrators = ["svi-jax"]
+calibrators = ["svi-unregistered"]
 
 [calibration.grid]
 k_min = -0.4
@@ -569,11 +569,13 @@ quantity = 1.0
 """
 """A complete, valid file. Every rejection test starts from this text and breaks one line.
 
-It names ``svi-jax`` -- F3-A's calibrator, which no adapter is registered for -- so that a command
-driven over it stops at the registry instead of running a whole session. It was ``svi-scipy``
-until F2-07 registered that one; the property the tests need is *unregistered*, not any particular
-name, and the two optional sections F2-07 added (``[market.synthetic]`` and ``[calibration.fit]``)
-are deliberately absent here, because absent is the shape every file that does not use them has.
+It names ``svi-unregistered`` -- a calibrator no adapter is, or will be, registered for -- so that a
+command driven over it stops at the registry instead of running a whole session. It was
+``svi-scipy`` until F2-07 registered that one and ``svi-jax`` until F3-W1 registered that one; the
+property the tests need is *unregistered*, which is why the name now says so rather than borrowing
+a producer that is merely not wired yet. The optional sections (``[market.synthetic]``,
+``[calibration.fit]``, ``[calibration.jax]``, ``[metrics]``) are deliberately absent here, because
+absent is the shape every file that does not use them has.
 """
 
 

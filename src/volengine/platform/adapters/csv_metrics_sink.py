@@ -38,9 +38,10 @@ schema that grows with the code, and a ``key=value;key=value`` cell is a grammar
 subscriber label containing either delimiter would break. JSON is unambiguous, quoted by
 :mod:`csv` like any other cell, and one ``json.loads`` away from a dict.
 
-**Not selectable from a configuration file yet.** ``--metrics`` still chooses between the logging
-and the null sink; picking this one needs a path in the TOML and a composition root that owns
-:meth:`CsvMetricsSink.close`. ``docs/SEAMS.md`` (Entrypoints) records it.
+**Selected by ``[metrics] sink = "csv"``, with a ``path``** (F3-W1). ``entrypoints/cli.py`` opens it
+and closes it around the whole run, because :meth:`CsvMetricsSink.close` is not part of the port
+and the code that opens a file is the one that knows when the run is over; ``--metrics`` and
+``--no-metrics`` override the table.
 """
 
 from __future__ import annotations

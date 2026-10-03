@@ -30,12 +30,21 @@ from tests.parametric_pricing.builders import (
 )
 from volengine.parametric_pricing.adapters.scipy_calibrator import (
     A_LIMIT,
+    B_START_MIN,
     BARRIER_BP,
     PRODUCER_ID,
+    REFERENCE_TOTAL_VARIANCE,
+    SIGMA_START,
     FitSettings,
     ScipyCalibrator,
+    _b_floor,
+    _clipped,
+    _cold_start,
+    _from_vector,
     _residuals,
+    _shrink,
     _to_vector,
+    _variance_scale,
 )
 from volengine.parametric_pricing.domain.calibration import CalibrationTask, SliceTask
 from volengine.parametric_pricing.domain.durrleman import butterfly_violation
@@ -503,6 +512,75 @@ def test_a_slice_whose_variance_collapses_on_the_mesh_is_answered_with_a_barrier
     # which answers with a barrier everywhere.
     assert np.all(residuals[len(K_AXIS) :] == BARRIER_BP)
     assert float(np.abs(residuals[: len(K_AXIS)]).max()) < BARRIER_BP
+
+
+# --- short tenors (F3-W1)
+
+
+DAILY_TENOR = 20.0 / (365.0 * 24.0)
+"""Twenty hours, the shortest tenor a Deribit chain lists for most of every day."""
+
+DAILY = SVIParams(a=0.0002, b=0.035, rho=-0.4, m=0.0, sigma=0.01)
+"""A twenty-hour smile at about 49% at the money, quoted six per cent either side: under a third of
+the reference variance, with wings steeper than the shrunk floor (about 0.027) and shallower than
+the absolute one (0.05)."""
+
+
+def daily_task() -> SliceTask:
+    return svi_task(params=DAILY, k=tuple(np.linspace(-0.06, 0.06, 9)), tenor_years=DAILY_TENOR)
+
+
+def test_the_slice_scale_is_its_weighted_mean_total_variance() -> None:
+    task = svi_task(weights=(1.0,) + (0.0,) * (len(K_AXIS) - 1))
+
+    assert _variance_scale(task) == pytest.approx(task.implied_vol[0] ** 2 * task.tenor_years)
+
+
+def test_a_month_starts_from_the_absolute_shape_it_always_did() -> None:
+    """At and above the reference nothing shrinks, which is what keeps every long-tenor fit -- and
+    every test above this section -- exactly where it was before F3-W1."""
+    start = SVIParams.from_free(_from_vector(_cold_start(svi_task())))
+
+    assert _shrink(svi_task()) == 1.0
+    assert start.sigma == pytest.approx(SIGMA_START)
+
+
+def test_a_daily_starts_from_a_shape_shrunk_to_its_own_variance() -> None:
+    task = daily_task()
+    shrink = _variance_scale(task) / REFERENCE_TOTAL_VARIANCE
+
+    start = SVIParams.from_free(_from_vector(_cold_start(task)))
+
+    assert 0.0 < shrink < 1.0
+    assert _shrink(task) == pytest.approx(shrink)
+    assert start.sigma == pytest.approx(SIGMA_START * math.sqrt(shrink))
+    assert start.b >= _b_floor(shrink) * (1.0 - 1e-9)
+
+
+def test_a_warm_start_on_a_daily_keeps_its_own_wings() -> None:
+    """The floor that keeps a flat fit able to grow wings is shrunk too, so yesterday's daily is
+    handed back as it was rather than lifted to a week's steepness every cycle."""
+    warm = SVIParams.from_free(
+        _from_vector(_clipped(DAILY.to_free(), _b_floor(_shrink(daily_task()))))
+    )
+
+    assert warm.b == pytest.approx(DAILY.b)
+
+
+def test_an_unshrunk_floor_would_have_lifted_those_wings() -> None:
+    """The guard on the test above: the daily's ``b`` really is below the absolute floor."""
+    lifted = SVIParams.from_free(_from_vector(_clipped(DAILY.to_free(), B_START_MIN)))
+
+    assert DAILY.b < B_START_MIN
+    assert lifted.b == pytest.approx(B_START_MIN)
+
+
+def test_a_daily_is_recovered_from_clean_quotes() -> None:
+    result = ScipyCalibrator().calibrate(None, one_slice(daily_task())).slices[0]
+
+    assert result.converged
+    assert not result.at_bound
+    assert result.rmse_vol_bp < 1.0
 
 
 # --- the port, and purity

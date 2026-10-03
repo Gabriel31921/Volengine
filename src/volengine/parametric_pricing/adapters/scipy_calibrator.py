@@ -31,6 +31,11 @@ ritual.
   where ``b -> 0`` leaves ``rho``, ``m`` and ``sigma`` unidentified, the cost surface flat in
   those directions, and the optimiser free to drift into a corner of the box that ``at_bound``
   then reports as a broken fit. See :attr:`FitSettings.ridge_bp`.
+
+**Short slices are fitted in their own units** (F3-W1). The cold start and the ridge were argued
+in absolute total variance and log-moneyness, sized for a week and more; below
+:data:`REFERENCE_TOTAL_VARIANCE` both shrink with the slice's own variance, so a daily starts as a
+daily and its drift is charged in its own scale. At and above it nothing changes.
 * **Unconstrained variables plus a practical box.** ``FreeParams`` already makes ``b, sigma > 0``
   and ``|rho| < 1`` structural, so no optimiser can propose ``rho = 1.4``. The box on top of it is
   the "practical bounds" of Design 5.4 -- a slice whose ``b`` has run to 4 is not a smile, it is a
@@ -200,19 +205,66 @@ UPPER: Final[NDArray[np.float64]] = np.array(
 )
 """Upper box in free coordinates."""
 
+REFERENCE_TOTAL_VARIANCE: Final[float] = 0.005
+"""The total variance below which the cold start and the ridge shrink with the slice (F3-W1):
+about a week at a 50% volatility.
+
+The start constants below and :attr:`FitSettings.ridge_bp` were argued and measured on slices of a
+week and more, and they are in absolute units -- total variance and log-moneyness -- which a short
+slice does not have much of: a twenty-hour slice at 50% volatility has a ninth of this value,
+quoted across a band a few hundredths of log-moneyness wide. Started at a week's shape, its level
+had to fall below zero to meet the quotes, the search stalled against the admissibility barrier,
+and the fit came back "converged" thousands of basis points off. So below this variance every one
+of those numbers is shrunk by the slice's own scale (:func:`_shrink`) -- variance-like ones by the
+ratio, log-moneyness-like ones by its square root, which is how raw SVI rescales when a slice is
+measured in its own standard deviations and under which Durrleman's ``g`` is, to first order,
+unchanged. Below the reference the start is therefore a fixed shape in those units: a bottom
+about 1.4 standard deviations wide, ``sqrt(W)``, and wings floored at about 0.7 of one.
+
+**At and above it nothing changes**, and that is why it is a ceiling and not a pure ratio. Scaled
+everywhere, the start of a month-long slice moves too, and the ridge -- a tie-breaker that pulls
+towards the start -- then moves the answer on clean quotes by more than the parameter recovery the
+long tenors are held to. Below the reference the old constants were the failure; above it they
+were the measured success, and the ceiling keeps both.
+
+A week because that is where F3-F's audit found the absolute constants fitting every shape tried,
+and measured rather than chosen: over 504 synthetic slices from twenty hours to three weeks --
+flat, skewed, offset and steep, at five and twenty basis points of noise -- the unshrunk constants
+failed 20, this reference fails 2, and those two sit above it and fail identically without the
+change (a skewed slice whose single start collapses to a flat fit, which is a basin and not a
+scale). A reference of 0.004 or 0.003 fails 10, by exhausting the evaluation budget on nearly flat
+three-day slices.
+"""
+
+VARIANCE_SCALE_FLOOR: Final[float] = 1.0e-12
+"""Smallest value :func:`_variance_scale` returns, so that nothing divides by an underflowed zero.
+
+A slice's own total variance is positive by construction -- every quoted volatility and the tenor
+are -- but their product can underflow for a tenor of a few microseconds, and the scale is a
+divisor. A trillionth is a one-second option at a 0.6% volatility: no chain this engine fits
+reaches it, and none that did could be inverted in the first place.
+"""
+
 B_START_MIN: Final[float] = 0.05
-"""Floor applied to ``b`` in the *starting point* only, never as a bound.
+"""Floor applied to ``b`` in the *starting point* only, never as a bound -- at and above
+:data:`REFERENCE_TOTAL_VARIANCE`, and shrunk with ``sqrt`` of the slice's scale below it.
 
 The one trap of an otherwise structural reparameterisation: ``softplus'`` underflows to zero for a
 very negative ``b_raw``, so a fit started at ``b = 0`` has an exactly zero Jacobian column for the
 wings and can never leave the flat slice, whatever the market says. It would converge, report a
 respectable-looking flat fit and never be noticed. Starting a little way up the curve costs
 nothing -- the optimiser is free to walk straight back down, and does on a genuinely flat chain.
+
+Shrunk on a short slice because ``b`` is total variance per unit of log-moneyness and a daily has
+little of either: unshrunk, this floor started a twenty-hour slice with wings ten times steeper
+than its whole smile.
 """
 
 SIGMA_START: Final[float] = 0.10
 """Curvature the cold start assumes: a moderately rounded bottom, roughly a tenth of the quoted
-band of a crypto chain. Only a starting point; nothing downstream depends on the value."""
+band of a crypto chain -- at and above :data:`REFERENCE_TOTAL_VARIANCE`, and shrunk with ``sqrt``
+of the slice's scale below it, where the quoted band narrows like ``sqrt(T)``. Only a starting
+point; nothing downstream depends on the value."""
 
 RHO_START: Final[float] = -0.30
 """Skew the cold start assumes. Negative, because a lifted downside wing is the shape of every
@@ -288,7 +340,8 @@ class FitSettings:
 
     ridge_bp: float = 5.0
     """Vol basis points charged per unit of movement away from the starting point, measured in
-    free coordinates. Non-negative and finite.
+    free coordinates -- and, below :data:`REFERENCE_TOTAL_VARIANCE`, with the level and ``m``
+    measured in the slice's own units (:func:`_units`). Non-negative and finite.
 
     A very small Tikhonov pull, and the answer to a failure that is invisible until it happens:
     **a market with no smile has no ``rho``, no ``m`` and no ``sigma``.** As ``b`` goes to zero
@@ -373,7 +426,47 @@ def _from_vector(x: NDArray[np.float64]) -> FreeParams:
     )
 
 
-def _clipped(free: FreeParams) -> NDArray[np.float64]:
+def _variance_scale(task: SliceTask) -> float:
+    """The slice's own total variance ``W``: the weighted mean of ``vol^2 * T`` over its quotes.
+
+    Weighted by the task's own weights, so a flagged wing at zero weight cannot move it, and the
+    same statistic the JAX calibrator computes on its padded rows, so the two producers shrink
+    their tuning by one ruler. Positive because the weights sum above zero and every volatility is
+    positive (``SliceTask``), floored at :data:`VARIANCE_SCALE_FLOOR` against underflow.
+    """
+    vol = np.asarray(task.implied_vol, dtype=np.float64)
+    weights = np.asarray(task.weights, dtype=np.float64)
+    scale = float(np.average(vol * vol * task.tenor_years, weights=weights))
+    return max(scale, VARIANCE_SCALE_FLOOR)
+
+
+def _shrink(task: SliceTask) -> float:
+    """How much smaller than :data:`REFERENCE_TOTAL_VARIANCE` this slice is: ``min(1, W / ref)``.
+
+    One at and above the reference, which leaves every slice the old constants were measured on
+    exactly where it was; the ratio below it. Variance-like quantities are multiplied by it and
+    log-moneyness-like ones by its square root.
+    """
+    return min(1.0, _variance_scale(task) / REFERENCE_TOTAL_VARIANCE)
+
+
+def _units(shrink: float) -> NDArray[np.float64]:
+    """What one unit of drift is in each free coordinate, ordered as :func:`_to_vector` orders them.
+
+    ``a`` is total variance and ``m`` is log-moneyness, so on a short slice their units shrink by
+    ``shrink`` and ``sqrt(shrink)``. ``b_raw``, ``rho_raw`` and ``sigma_raw`` are already
+    scale-free -- ``tanh`` has no unit, and a softplus preimage of a small value is its logarithm,
+    so a step in it is a *relative* change -- and stay at one.
+    """
+    return np.array([shrink, 1.0, 1.0, math.sqrt(shrink), 1.0], dtype=np.float64)
+
+
+def _b_floor(shrink: float) -> float:
+    """:data:`B_START_MIN` on this slice: shrunk like a slope of variance against moneyness."""
+    return B_START_MIN * math.sqrt(shrink)
+
+
+def _clipped(free: FreeParams, b_floor: float) -> NDArray[np.float64]:
     """A starting point inside the box, with ``b`` lifted off the flat floor.
 
     A warm start is the previous cycle's *accepted* parameters, so it is admissible -- but the box
@@ -384,10 +477,12 @@ def _clipped(free: FreeParams) -> NDArray[np.float64]:
 
     The ``b`` floor is the underflow trap :data:`B_START_MIN` documents, and it applies to a warm
     start for exactly the same reason it applies to a cold one -- a slice that fitted flat
-    yesterday would otherwise be unable to grow wings today.
+    yesterday would otherwise be unable to grow wings today. It arrives already shrunk to the slice
+    (:func:`_b_floor`): an unshrunk floor would lift a daily's accepted ``b`` back to a week's every
+    cycle, and undo the warm start it was handed.
     """
     x = np.clip(_to_vector(free), LOWER, UPPER)
-    x[1] = max(x[1], _free_of(b=B_START_MIN).b_raw)
+    x[1] = max(x[1], _free_of(b=b_floor).b_raw)
     return x
 
 
@@ -399,7 +494,9 @@ def _cold_start(task: SliceTask) -> NDArray[np.float64]:
     of the curve, the spread of total variance across the quoted band is roughly what the wings
     have to cover, and the strike where the minimum sits is roughly ``m``. Everything else --
     curvature and skew -- starts at a typical crypto shape, because nothing in the data pins them
-    without already solving the problem.
+    without already solving the problem; on a short slice that shape is shrunk to the slice
+    (:data:`REFERENCE_TOTAL_VARIANCE`), so a daily starts as a daily and not as a week squeezed into
+    a day.
 
     The level is set so that the *minimum* of the curve lands on the lowest observed total
     variance rather than ``a`` itself, since ``a`` is the intercept and sits roughly
@@ -410,14 +507,17 @@ def _cold_start(task: SliceTask) -> NDArray[np.float64]:
     k = np.asarray(task.log_moneyness, dtype=np.float64)
     vol = np.asarray(task.implied_vol, dtype=np.float64)
     w = vol * vol * task.tenor_years
+    shrink = _shrink(task)
+    b_floor = _b_floor(shrink)
+    sigma = max(SIGMA_START * math.sqrt(shrink), SIGMA_MIN)
 
     span_k = float(k.max() - k.min())
     span_w = float(w.max() - w.min())
-    b = min(max(span_w / span_k if span_k > 0 else 0.0, B_START_MIN), B_MAX)
+    b = min(max(span_w / span_k if span_k > 0 else 0.0, b_floor), B_MAX)
     m = min(max(float(k[int(np.argmin(w))]), -M_LIMIT), M_LIMIT)
-    a = min(max(float(w.min()) - b * SIGMA_START, 0.0), A_LIMIT)
+    a = min(max(float(w.min()) - b * sigma, 0.0), A_LIMIT)
 
-    return _clipped(SVIParams(a=a, b=b, rho=RHO_START, m=m, sigma=SIGMA_START).to_free())
+    return _clipped(SVIParams(a=a, b=b, rho=RHO_START, m=m, sigma=sigma).to_free(), b_floor)
 
 
 def _mesh(task: SliceTask, settings: FitSettings) -> NDArray[np.float64]:
@@ -553,6 +653,7 @@ def _run(task: SliceTask, start: NDArray[np.float64], settings: FitSettings) -> 
     mesh = _mesh(task, settings)
     template = start.copy()
     index = list(searched)
+    units = _units(_shrink(task))[index]
 
     def residuals(sub: NDArray[np.float64]) -> NDArray[np.float64]:
         x = template.copy()
@@ -560,8 +661,10 @@ def _run(task: SliceTask, start: NDArray[np.float64], settings: FitSettings) -> 
         # The ridge lives here rather than in `_residuals` because it is the only term that
         # depends on where the search began, and because it is only ever applied to the
         # coordinates actually being searched: a pinned parameter cannot drift, so charging it
-        # for a distance it never travelled would be arithmetic with no meaning.
-        ridge = settings.ridge_bp * (sub - start[index])
+        # for a distance it never travelled would be arithmetic with no meaning. The drift is
+        # measured in the slice's own units below the reference variance (`_units`), so the same
+        # `ridge_bp` is the same tie-breaker on a daily as on a week.
+        ridge = settings.ridge_bp * (sub - start[index]) / units
         return np.concatenate([_residuals(x, task, mesh, settings), ridge])
 
     solution = least_squares(
@@ -726,7 +829,7 @@ class ScipyCalibrator:
         if warm is None:
             return _run(task, cold, self._settings)
 
-        attempt = _run(task, _clipped(warm.to_free()), self._settings)
+        attempt = _run(task, _clipped(warm.to_free(), _b_floor(_shrink(task))), self._settings)
         if _healthy(attempt.result):
             return attempt
 

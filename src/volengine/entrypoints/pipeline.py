@@ -34,11 +34,17 @@ the engine be ignorant of the wiring.
 
 **Adapters arrive by name.** :func:`default_adapters` is the registry that maps a configured
 string -- ``provider = "constant"`` -- onto the callable that builds the object, and it is the
-only place in the engine that *constructs* one. It holds seven: the walking skeleton's three,
-F2's three beside them, and since F3-C the live venue, so a file may name a constant feed, a
-synthetic one or Deribit, a mean or a fit, a console or a file. A name it does not hold fails here
-with a message that says which one was not registered. Passing the registry into
-:func:`build_pipeline` rather than reaching for it keeps the graph testable with fakes.
+only place in the engine that *constructs* one. It holds eight: the walking skeleton's three,
+F2's three beside them, since F3-C the live venue, and since F3-W1 the JAX calibrator, so a file
+may name a constant feed, a synthetic one or Deribit, a mean or one of two fits, a console or a
+file. A name it does not hold fails here with a message that says which one was not registered.
+Passing the registry into :func:`build_pipeline` rather than reaching for it keeps the graph
+testable with fakes.
+
+**Two of the eight need an optional extra, and both are imported lazily** -- the Deribit feed's
+transport inside its adapter, the JAX calibrator's whole module inside its factory -- so that this
+module, and the CLI with it, import on an installation without either. Their factories are where a
+missing extra is noticed: at wiring time, with the command that installs it in the message.
 
 **Recording and replay are modes of a run, not entries in that registry** (ADR-004).
 :func:`with_recording` decorates every provider with a tap onto a file; :func:`with_replay`
@@ -99,12 +105,14 @@ from volengine.contracts.events import (
 )
 from volengine.entrypoints.config import (
     DERIBIT_PROVIDER,
+    JAX_CALIBRATOR,
     SYNTHETIC_PROVIDER,
     AppConfig,
     CalibrationConfig,
     ConfigError,
     MarketConfig,
     RiskConfig,
+    require_jax_extra,
 )
 from volengine.market_data.adapters.constant import ConstantProvider
 from volengine.market_data.adapters.deribit_ws import DeribitProvider
@@ -178,7 +186,8 @@ class Adapters:
 
 
 def default_adapters() -> Adapters:
-    """Every concrete adapter this build knows how to make: three feeds, two producers, two writers.
+    """Every concrete adapter this build knows how to make: three feeds, three producers, two
+    writers.
 
     **The only function in the engine that constructs an adapter**, which is what keeps every
     other module -- and every configuration file -- ignorant of infrastructure. A name it does not
@@ -191,9 +200,9 @@ def default_adapters() -> Adapters:
     threshold that ADR-012 already put somewhere else, and no factory reaches past its own section
     to find one.
 
-    Three of the seven take no settings at all, and that is a property of those adapters rather
+    Three of the eight take no settings at all, and that is a property of those adapters rather
     than an oversight: a constant feed, a weighted mean and a console have nothing a deployment
-    could retune. The other four read the sections F2-07 and F3-C gave them.
+    could retune. The other five read the sections F2-07, F3-C and F3-W1 gave them.
     """
     return Adapters(
         providers={
@@ -208,6 +217,7 @@ def default_adapters() -> Adapters:
             # its own docstring. Passing it through rather than substituting a default here keeps
             # this module from holding an opinion about a number it does not own.
             SCIPY_ID: lambda calibration: ScipyCalibrator(calibration.fit),
+            JAX_CALIBRATOR: _jax_calibrator,
         },
         writers={
             "console": lambda _risk: ConsoleReportWriter(),
@@ -253,6 +263,28 @@ def _deribit_provider(market: MarketConfig) -> MarketDataProvider:
             f"{', '.join(missing)}, which the 'deribit' extra installs: uv sync --extra deribit"
         )
     return DeribitProvider(market.conventions, market.deribit)
+
+
+def _jax_calibrator(calibration: CalibrationConfig) -> Calibrator:
+    """The JAX calibrator, on the tuning ``[calibration.jax]`` states or on its own defaults.
+
+    Its module imports ``jax`` at the top, which is right for an adapter and wrong for a registry
+    that every run imports, so it is imported here, after the extra has been found. The
+    constructor compiles both cycles for the padded shape (ADR-009), so a configuration naming
+    ``svi-jax`` pays its compilation while the pipeline is being wired -- at start-up, which is
+    where ADR-009 wants it -- and not inside the first snapshot's latency budget.
+
+    ``calibration.jax`` is ``None`` unless the file states the table, and the calibrator answers
+    that with the settings it ships with, exactly as ``svi-scipy`` answers an absent
+    ``[calibration.fit]``. The padded shape stays the constructor's default (``CalibrationConfig``
+    says why).
+    """
+    require_jax_extra(f"calibrator {JAX_CALIBRATOR!r}")
+    # Lazily, for the reason above: the check that precedes it is what makes a missing extra a
+    # message rather than an `ImportError`.
+    from volengine.parametric_pricing.adapters.jax_calibrator import JaxCalibrator
+
+    return JaxCalibrator(calibration.jax)
 
 
 def _csv_report_writer(risk: RiskConfig) -> ReportWriter:

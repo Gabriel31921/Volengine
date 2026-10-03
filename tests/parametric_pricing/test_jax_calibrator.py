@@ -242,6 +242,48 @@ def test_a_changing_chain_composition_never_recompiles() -> None:
     assert compilations_since(mark) == 0
 
 
+SHORT = SVIParams(a=0.0002, b=0.004, rho=-0.4, m=0.0, sigma=0.03)
+"""A twenty-hour smile at about 45% at the money: a ninth of the reference variance, so the
+shrink of F3-W1 is well inside its range rather than at its ceiling."""
+
+
+@pytest.mark.no_recompilation
+def test_short_tenors_never_recompile() -> None:
+    """The F3-W1 shrink changes values, not shapes, so it costs no compilation.
+
+    It is computed from the slice inside the compiled cycles -- a reduction over the row it is
+    applied to -- rather than passed in as a new argument or branched on in Python, either of
+    which would be a new signature. A chain of a daily, a three-day and a weekly slice, cold then
+    warm, beside a monthly, is fitted by the specialisation the long tenors already used.
+
+    The long-tenor fit before the mark is what makes the claim exact: the first call through
+    ``calibrate`` also compiles the handful of eager host-side operations around the cycles, and
+    this test is about what the *short* tenors add -- which must be nothing.
+    """
+    calibrator = make_jax_calibrator()
+    warm_up = one_slice(svi_task())
+    calibrator.calibrate({NEAR: calibrator.calibrate(None, warm_up).slices[0].params}, warm_up)
+    hour = 1.0 / (365.0 * 24.0)
+    task = make_calibration_task(
+        slices=tuple(
+            svi_task(
+                params=SHORT,
+                k=K_AXIS[7:14],
+                expiry=datetime(2026, 9, 1 + index, 8, tzinfo=UTC),
+                tenor_years=hours * hour,
+            )
+            for index, hours in enumerate((20.0, 72.0, 168.0, 720.0))
+        )
+    )
+
+    mark = len(_events)
+    cold = calibrator.calibrate(None, task)
+    calibrator.calibrate({one.expiry: one.params for one in cold.slices}, task)
+
+    assert compilations_since(mark) == 0
+    assert cold.slices[0].rmse_vol_bp < 1.0
+
+
 @pytest.mark.no_recompilation
 def test_the_compilation_counter_really_does_rise_for_a_new_shape() -> None:
     """The guard on the guard. Without it, the test above would pass just as happily against a

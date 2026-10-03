@@ -18,20 +18,25 @@ organised by what was checked rather than by component, and each section says wh
    measured here, and left open: closing it moves either Market Data's tenor origin or Risk's
    extrapolation, and F3-F was the stage that proves neither context needs to change for a second
    market (``docs/SEAMS.md``).
-4. **The scipy calibrator cannot fit a slice under about a day.** Not a daycount fault -- item 1
-   shows the volatilities arriving right -- but where the audit led: the cold start and the
-   ridge are in absolute total variance, sized for tenors of a week and more, and a one-day slice
-   has a hundredth of that. The fit comes back "converged" tens of vol points off, the acceptance
-   rule refuses the slice, and the surface goes out ``DEGRADED`` without it -- which on a live
-   Deribit chain, where the nearest expiry is a daily nearly all the time, would be every surface.
-   Pinned as a strict ``xfail``, so the fix has a test waiting for it.
+4. **Both SVI calibrators fit short slices** -- since F3-W1. F3-F found the scipy one could not:
+   not a daycount fault -- item 1 shows the volatilities arriving right -- but its cold start and
+   ridge were in absolute total variance, sized for a week and more, and a one-day slice has a
+   ninth of a week's. The fit came back "converged" thousands of basis points off, the acceptance
+   rule refused the slice, and the surface went out ``DEGRADED`` without it -- which on a live
+   Deribit chain, where the nearest expiry is a daily nearly all the time, would have been every
+   surface. Both calibrators now shrink their start and ridge with the slice's own variance below
+   a week's (``scipy_calibrator.REFERENCE_TOTAL_VARIANCE``), and the frontier F3-F measured --
+   twenty hours, three days with skew, a week -- is asserted here on both, with a guard showing
+   the twenty-hour slice still fails without the shrink.
 """
 
 from __future__ import annotations
 
 import asyncio
 import math
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
+from importlib.util import find_spec
 
 import pytest
 
@@ -58,10 +63,13 @@ from volengine.market_data.application.acl import build_snapshot_id, to_market_s
 from volengine.market_data.domain.option_quote import OptionKindD
 from volengine.market_data.domain.quote_chain import QuoteChain
 from volengine.market_data.domain.snapshot_policy import QualityAssessment
+from volengine.parametric_pricing.adapters import scipy_calibrator
 from volengine.parametric_pricing.adapters.scipy_calibrator import ScipyCalibrator
 from volengine.parametric_pricing.application.acl import to_calibration_task
 from volengine.parametric_pricing.application.calibrate_on_snapshot import CalibrateOnSnapshot
 from volengine.parametric_pricing.application.calibration_state import CalibrationState
+from volengine.parametric_pricing.domain.calibration import CalibrationTask
+from volengine.parametric_pricing.domain.ports import Calibrator
 from volengine.platform.clock import ManualClock
 from volengine.risk.application.acl import to_surface_view
 from volengine.risk.domain.surface_view import SurfaceView
@@ -90,23 +98,32 @@ def tenor_of(expiry: datetime, origin: datetime) -> float:
 # --- 1. the convention reaches the calibrator intact
 
 
-def short_dated_snapshot(vol_noise_bp: float = 0.0) -> MarketSnapshot:
-    """A synthetic chain twenty hours from a daily expiry, beside a monthly, frozen one second in.
+def short_dated_snapshot(
+    vol_noise_bp: float = 0.0,
+    before: timedelta = EXPIRY - SESSION_START,
+    shape: SVIParamsSpec | None = None,
+    half_band: float = 0.05,
+) -> MarketSnapshot:
+    """A synthetic chain ``before`` a daily expiry -- twenty hours unless told otherwise -- beside a
+    monthly, frozen one second in.
 
-    The daily's SVI is flat at ``FLAT_VOL`` in total variance at the session's start, so the
-    volatility it implies at any later instant is ``sqrt(w / T(now))`` -- known exactly.
+    The near slice's SVI is flat at ``FLAT_VOL`` in total variance at the session's start unless a
+    ``shape`` is given, so by default the volatility it implies at any later instant is
+    ``sqrt(w / T(now))`` -- known exactly. Its strikes span ``half_band`` either side of the money.
     """
-    daily = EXPIRY - SESSION_START
+    start = EXPIRY - before
     monthly = timedelta(days=30)
-    w = FLAT_VOL * FLAT_VOL * tenor_of(EXPIRY, SESSION_START)
+    w = FLAT_VOL * FLAT_VOL * tenor_of(EXPIRY, start)
     config = SyntheticConfig(
-        expiries=(daily, monthly),
+        expiries=(before, monthly),
         true_params={
-            daily: SVIParamsSpec(a=w, b=0.0, rho=0.0, m=0.0, sigma=0.1),
+            before: SVIParamsSpec(a=w, b=0.0, rho=0.0, m=0.0, sigma=0.1)
+            if shape is None
+            else shape,
             monthly: SVIParamsSpec(a=0.02, b=0.05, rho=-0.3, m=0.0, sigma=0.2),
         },
         strikes_per_expiry=11,
-        log_moneyness_range=(-0.05, 0.05),
+        log_moneyness_range=(-half_band, half_band),
         forward0=FORWARD,
         cycles=1,
         interval_seconds=0.0,
@@ -114,7 +131,7 @@ def short_dated_snapshot(vol_noise_bp: float = 0.0) -> MarketSnapshot:
         vol_noise_bp=vol_noise_bp,
     )
     conventions = make_conventions()
-    provider = SyntheticProvider(conventions, config, SESSION_START)
+    provider = SyntheticProvider(conventions, config, start)
     chain = QuoteChain(conventions, make_thresholds())
 
     async def feed() -> None:
@@ -123,7 +140,7 @@ def short_dated_snapshot(vol_noise_bp: float = 0.0) -> MarketSnapshot:
             chain.apply(update)
 
     asyncio.run(feed())
-    frozen = chain.snapshot(SESSION_START + timedelta(seconds=1))
+    frozen = chain.snapshot(start + timedelta(seconds=1))
     return to_market_snapshot(
         snapshot=frozen,
         snapshot_id=build_snapshot_id(frozen.market_id, 0),
@@ -283,42 +300,120 @@ def test_with_no_skew_the_extrapolation_is_exact() -> None:
     )
 
 
-# --- 4. what the audit found one context over
+# --- 4. what the audit found one context over, fixed in F3-W1
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "F3-F audit finding: ScipyCalibrator's cold start (B_START_MIN, SIGMA_START) and ridge are "
-        "in absolute total variance and swamp a slice under about a day; docs/SEAMS.md"
+HAS_JAX_EXTRA = all(find_spec(name) is not None for name in ("jax", "optax"))
+
+
+def scipy() -> Calibrator:
+    return ScipyCalibrator()
+
+
+def jax() -> Calibrator:
+    """The JAX calibrator on the test suite's shared shape and settings, and so its compilation.
+
+    Imported here rather than at the top: the module imports ``jax``, an optional extra, and every
+    other test in this file runs without it.
+    """
+    from tests.parametric_pricing.jax_builders import make_jax_calibrator
+
+    return make_jax_calibrator()
+
+
+CALIBRATORS = [
+    pytest.param(scipy, id="svi-scipy"),
+    pytest.param(
+        jax,
+        id="svi-jax",
+        marks=pytest.mark.skipif(not HAS_JAX_EXTRA, reason="needs the jax extra"),
     ),
-)
-def test_the_scipy_calibrator_fits_a_one_day_slice() -> None:
-    """Fifty basis points of noise, the synthetic feed's default. Measured: the daily comes back
-    "converged" at about 8,200 bp RMSE, from twenty hours out down to ten minutes; a slice three
-    days out with any skew fails the same way, and a week out every shape tried fits."""
-    task = to_calibration_task(
-        short_dated_snapshot(vol_noise_bp=NOISE_BP), make_calibration_config().weighting
-    )
+]
+"""Both SVI producers, the second skipped where the extra is not installed."""
+
+
+def task_of(snapshot: MarketSnapshot) -> CalibrationTask:
+    task = to_calibration_task(snapshot, make_calibration_config().weighting)
     assert task is not None
-
-    result = ScipyCalibrator().calibrate(None, task)
-
-    daily = result.slices[0]
-    assert daily.expiry == EXPIRY
-    assert daily.converged
-    assert daily.rmse_vol_bp < 50.0
+    return task
 
 
-def test_the_scipy_calibrator_does_fit_the_monthly_beside_it() -> None:
-    """The guard on the xfail above: the same task's thirty-day slice fits, so what fails is the
-    tenor and not the chain, the task or the calibrator wholesale."""
-    task = to_calibration_task(
-        short_dated_snapshot(vol_noise_bp=NOISE_BP), make_calibration_config().weighting
+def skewed(before: timedelta) -> SVIParamsSpec:
+    """A 50% at-the-money smile with a lifted downside, its width scaled to the tenor.
+
+    Half of the at-the-money variance in the level and half in the wings, ``rho = -0.5``, and a
+    curvature that is ``0.2`` at a 50%-vol month and narrows like ``sqrt(w)`` below it -- the shape
+    F3-F's audit found three-day slices failing on.
+    """
+    w = FLAT_VOL * FLAT_VOL * before.total_seconds() / SECONDS_PER_YEAR
+    width = math.sqrt(w / 0.02)
+    return SVIParamsSpec(a=0.5 * w, b=0.5 * w / (0.2 * width), rho=-0.5, m=0.0, sigma=0.2 * width)
+
+
+def assert_fits_the_near_slice(calibrator: Calibrator, snapshot: MarketSnapshot) -> None:
+    """Converged, unpinned and under the acceptance RMSE: what the use case would publish."""
+    near = calibrator.calibrate(None, task_of(snapshot)).slices[0]
+
+    assert near.expiry == EXPIRY
+    assert near.converged
+    assert not near.at_bound
+    assert near.rmse_vol_bp < make_calibration_config().acceptance.max_rmse_vol_bp
+
+
+@pytest.mark.parametrize("make", CALIBRATORS)
+def test_the_calibrator_fits_a_one_day_slice(make: Callable[[], Calibrator]) -> None:
+    """Twenty hours out, flat, at fifty basis points of noise -- the synthetic feed's default.
+
+    F3-F's strict ``xfail`` until F3-W1: measured then at about 8,200 bp RMSE on the scipy
+    calibrator, from twenty hours out down to ten minutes.
+    """
+    assert_fits_the_near_slice(make(), short_dated_snapshot(vol_noise_bp=NOISE_BP))
+
+
+@pytest.mark.parametrize("make", CALIBRATORS)
+def test_the_calibrator_fits_a_skewed_three_day_slice(make: Callable[[], Calibrator]) -> None:
+    """Three days out, skewed, quoted across a band that widens with the tenor."""
+    before = timedelta(days=3)
+    snapshot = short_dated_snapshot(
+        vol_noise_bp=NOISE_BP, before=before, shape=skewed(before), half_band=0.095
     )
-    assert task is not None
 
-    result = ScipyCalibrator().calibrate(None, task)
+    assert_fits_the_near_slice(make(), snapshot)
+
+
+@pytest.mark.parametrize("make", CALIBRATORS)
+def test_the_calibrator_fits_a_skewed_one_week_slice(make: Callable[[], Calibrator]) -> None:
+    """A week out: the shortest tenor the absolute constants fitted, and the reference the shrink
+    is measured from. Asserted so the change of units below it cannot cost the tenor above."""
+    before = timedelta(days=7)
+    snapshot = short_dated_snapshot(
+        vol_noise_bp=NOISE_BP, before=before, shape=skewed(before), half_band=0.145
+    )
+
+    assert_fits_the_near_slice(make(), snapshot)
+
+
+def test_without_the_shrink_the_one_day_slice_is_still_not_fitted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The guard on the tests above: the fix is the change of units, and nothing else.
+
+    A reference variance far below any slice makes the shrink one everywhere, which is the
+    calibrator as F3-F found it -- absolute start, absolute ridge -- and the same twenty-hour
+    slice comes back thousands of basis points off again.
+    """
+    monkeypatch.setattr(scipy_calibrator, "REFERENCE_TOTAL_VARIANCE", 1e-12)
+
+    near = ScipyCalibrator().calibrate(None, task_of(short_dated_snapshot(NOISE_BP))).slices[0]
+
+    assert near.rmse_vol_bp > 1_000.0
+
+
+@pytest.mark.parametrize("make", CALIBRATORS)
+def test_the_calibrator_does_fit_the_monthly_beside_it(make: Callable[[], Calibrator]) -> None:
+    """The guard on the tests above from the other side: the same task's thirty-day slice fits,
+    so what is being measured is the tenor and not the chain, the task or the calibrator."""
+    result = make().calibrate(None, task_of(short_dated_snapshot(vol_noise_bp=NOISE_BP)))
 
     monthly = result.slices[1]
     assert monthly.converged

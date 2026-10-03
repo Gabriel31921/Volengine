@@ -113,28 +113,20 @@ close naturally in a later phase.
   tolerance, and the exclusion of the reserved rows is asserted exactly on one reservation instead.
   Closing it means giving up single precision or fixing the reduction order, and both cost more
   than the identity is worth.
-- **The scipy calibrator cannot fit a slice under about three days.** Found by F3-F's short-tenor
-  audit. Its cold start (`B_START_MIN = 0.05`, `SIGMA_START = 0.10`) and the ridge that holds a fit
-  near it are in absolute total variance, sized for tenors of a week or more, and a one-day slice has
-  about a hundredth of that variance: the fit comes back "converged" thousands of basis points off
-  and the acceptance rule refuses it. Measured on synthetic chains at 50 % vol: a twenty-hour slice
-  fails with any noise and any shape, a three-day one fails with skew, a seven-day one fits every
-  shape tried. On a live Deribit chain the nearest expiry is a daily nearly all day, so it would be
-  dropped from every surface and the surface published `DEGRADED`. The volatilities reaching the
-  calibrator are right -- the daycount and the 08:00 UTC expiry were audited and hold -- so the fix
-  is a start and a ridge scaled by the slice's own variance, in this adapter.
-  `tests/entrypoints/test_short_tenors.py` holds it as a strict `xfail`.
+- **A single cold start can collapse a skewed slice to a flat fit.** `ScipyCalibrator` starts each
+  slice once from a shape read off its quotes; on a minority of skewed slices the search lets `b`
+  fall before it finds the skew and stops, "converged" and unpinned, hundreds of basis points off,
+  which the acceptance rule then refuses. F3-W1 measured it at 2 of 504 synthetic slices, both a
+  week or longer -- at or above `scipy_calibrator.REFERENCE_TOTAL_VARIANCE`, the one place the
+  short-tenor threshold is stated, where the start is the absolute one F3-F found fitting every
+  shape it tried -- and identical without F3-W1's change. Below that variance the start and the
+  ridge shrink with the slice and every short slice measured fits. A second start is what would
+  close it, and that is the JAX cold cycle's multi-start (Design 5.6), not this baseline's.
 - **The JAX cold cycle is "after a failure" and never "periodic".** Design 5.6 asks for both, and a
   `Calibrator` reads no clock and keeps no state (the port forbids it), so a pure function cannot
   know that an interval has elapsed. The half that is expressible is implemented: a warm start that
   comes back unconverged or pinned is retried from the multi-start. The periodic half belongs to
   the use case that owns `CalibrationState`, and nothing there schedules it yet.
-- **The JAX calibrator has no TOML home and is not in `default_adapters`.** `JaxFitSettings` and
-  `PadShape` are constructor arguments with working defaults, and `svi-jax` is reachable from
-  Python and from the contract harness but not from a configuration file. Wiring it means a factory
-  that imports an optional extra lazily and a settings section beside `[calibration.fit]`; F3-A
-  stayed inside the two modules `Implementation.md` names for it. Until then a deployment runs the
-  scipy baseline.
 - **`adapters/jax_greeks.py` has no consumer in the engine, deliberately.** Greeks do not travel in
   the contract (ADR-001, Design 2.2) and Risk computes its own by bumping (Design 7.4), so the AD
   greeks of Design 5.8 are a module an analyst calls and the pipeline does not. Nothing imports it,
@@ -158,7 +150,7 @@ close naturally in a later phase.
 - **The torch learner has no TOML home and is not in `default_adapters`.** `TorchFitSettings`,
   `NetworkSpec` and the penalty mesh are constructor arguments with working defaults, and
   `mlp-torch` is reachable from Python and from the contract harness but not from a configuration
-  file -- the same condition `svi-jax` has been in since F3-A, for the same reason: F3-D stayed
+  file -- the condition `svi-jax` was in from F3-A until F3-W1, for the same reason: F3-D stayed
   inside the adapter module `Implementation.md` names for it. Wiring it is a larger change than
   the JAX one, because the producer runs a different use case (`TrainOnSnapshot`, with a replay
   buffer, a gate, a schedule and a seed of its own) and the composition root's `_Producer` holds a
@@ -298,16 +290,18 @@ close naturally in a later phase.
   thresholds, the restart schedule, the learner's own settings or the seed it would need. F3-D
   left it that way on purpose rather than by omission: the wiring is a composition-root change
   (`_Producer` holds a `CalibrateOnSnapshot`, `Adapters` has no `learners` mapping, and a lazily
-  importing factory for an optional extra is the same question `svi-jax` has been waiting on),
+  importing factory for an optional extra is the shape `svi-jax` took in F3-W1),
   and the numbers those sections would carry are now measurable rather than guessed -- the
   defaults in `TorchFitSettings` are argued against the synthetic chain -- but they have not yet
-  met the real recorded fixture. Whoever wires it should wire `svi-jax` in the same move, since
-  the factory shape is the same. F3-E's comparative report (`risk/application/compare_producers.py`)
-  already runs for any two configured parametric producers on a market (`flat-vol` and
-  `svi-scipy` today); wiring the neural one is what would make it compare the two engines. `--calibrators` therefore still selects among parametric
+  met the real recorded fixture. F3-W2 is the stage that wires it, on the lazily importing factory
+  F3-W1 gave `svi-jax`. F3-E's comparative report (`risk/application/compare_producers.py`)
+  already runs for any two configured parametric producers on a market (`svi-scipy` and `svi-jax`
+  in `examples/svi-scipy-vs-jax.toml`); wiring the neural one is what would make it compare the
+  two engines. `--calibrators` therefore still selects among parametric
   producers only, which is why its help line does not repeat Design 8.1's `svi,neural` example.
-- **The shipped examples' position expiries are fixed instants (2027-06-25) that will rot.** Both
-  `examples/walking-skeleton.toml` and `examples/synthetic-svi.toml` carry one. TOML has no "N
+- **The shipped examples' position expiries are fixed instants (2027-06-25) that will rot.**
+  `examples/walking-skeleton.toml`, `examples/synthetic-svi.toml` and
+  `examples/svi-scipy-vs-jax.toml` each carry one. TOML has no "N
   months from now" literal, while the feeds' tenors are relative to start-up, so a file can only
   pin an absolute date inside the window those tenors currently cover. Past it, valuation refuses with `ExpiredInstrumentError` instead of interpolating
   a value — a loud failure, not a silent one, but a maintenance date nothing enforces. Each file's
@@ -320,13 +314,6 @@ close naturally in a later phase.
   freshness policy. `examples/multi-market.toml` shows the cost: the synthetic market runs on the
   venue's wider Huber scale and larger budget, which it does not need. Per-market calibration
   state, grids and books are real (Design 4.7); per-market *thresholds* for them are not.
-- **The CSV metrics sink has no TOML or CLI home.** `platform/adapters/csv_metrics_sink.py` writes
-  every measurement to a file stamped by the engine's clock, and `--metrics` still selects between
-  `LoggingMetricsSink` and the null sink. Selecting it needs a path in the configuration and the
-  composition root owning `close()` -- the port has none, so the run that opens the file has to be
-  the one that ends it. F3-E built the adapter and left the selection to the same composition-root
-  move as the two unreachable producers.
-
 ## Cross-cutting
 
 - **`_require_positive_finite` is written out in five domain modules.** The same argument as

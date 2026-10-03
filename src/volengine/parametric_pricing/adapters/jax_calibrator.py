@@ -50,10 +50,13 @@ using JAX -- and risk 5 of Design 11 is that failure.
   domain's own ``SVIParams.implied_vol``. So the two calibrators' metrics are produced by the same
   code at the same precision and the comparison is not measuring a dtype.
 
-**What is shared with the baseline on purpose: the practical bounds.** They are imported from
-``scipy_calibrator`` rather than restated. ``at_bound`` is half of ADR-006's acceptance rule and
-ADR-027 argues that a bound is the *ruler* the rule is read against, not a threshold a deployment
-tunes -- two producers judged by two rulers would be two acceptance rules wearing one name. The
+**What is shared with the baseline on purpose: the practical bounds, and the reference variance.**
+They are imported from ``scipy_calibrator`` rather than restated -- the reference being the total
+variance below which both producers shrink their cold start and their ridge with the slice
+(F3-W1), so that one ``ridge_bp`` means one thing to both. ``at_bound`` is half of ADR-006's
+acceptance rule and ADR-027 argues that a bound is the *ruler* the rule is read against, not a
+threshold a deployment tunes -- two producers judged by two rulers would be two acceptance rules
+wearing one name. The
 search here is unconstrained, so the test is "at or past the bound" rather than "stopped at it",
 which is the same statement about the same region: the optimiser wanted to leave the region a fit
 is allowed to live in.
@@ -83,6 +86,7 @@ from volengine.parametric_pricing.adapters.scipy_calibrator import (
     BOUND_ATOL,
     BOUND_RTOL,
     M_LIMIT,
+    REFERENCE_TOTAL_VARIANCE,
     RHO_MAX,
     SIGMA_MAX,
     SIGMA_MIN,
@@ -131,7 +135,8 @@ also keeps the square root in the minimum-variance term differentiable.
 """
 
 B_START_MIN: Final[float] = 0.05
-"""Floor on ``b`` in a *starting point*, never a bound.
+"""Floor on ``b`` in a *starting point*, never a bound -- at and above the reference total variance,
+shrunk with the slice below it (:func:`_shrink`).
 
 ``softplus'`` underflows for a very negative preimage, so a fit started at exactly ``b = 0`` has a
 vanishing gradient for the wings and can never grow them, whatever the market says. It would
@@ -141,7 +146,8 @@ nothing: the optimiser walks straight back down on a genuinely flat chain.
 
 SIGMA_START: Final[float] = 0.10
 """Curvature a cold start assumes: a moderately rounded bottom, roughly a tenth of the quoted band
-of a crypto chain."""
+of a crypto chain -- at and above the reference total variance, shrunk with the slice below it,
+where the quoted band narrows like ``sqrt(T)`` (:func:`_shrink`)."""
 
 RHO_START: Final[float] = -0.30
 """Skew a cold start assumes. Negative, because a lifted downside wing is the shape of every equity
@@ -214,7 +220,8 @@ class JaxFitSettings:
 
     ridge_bp: float = 5.0
     """Vol basis points charged per unit of movement away from the starting point, in free
-    coordinates. Non-negative.
+    coordinates -- the level and ``m`` in the slice's own units below a week's total variance,
+    as the baseline measures them (:func:`_drift`). Non-negative.
 
     A tie-breaker and not a prior, for the reason ADR-027 sets out: a market with no smile has no
     ``rho``, no ``m`` and no ``sigma``, the cost surface is a plateau in those directions, and
@@ -569,11 +576,11 @@ def _objective(
         )
     )
 
-    ridge = jnp.sum(_huber(settings.ridge_bp * _drift(x, start), huber))
+    ridge = jnp.sum(_huber(settings.ridge_bp * _drift(x, start, _shrink(data)), huber))
     return fit + penalty + ridge
 
 
-def _drift(x: jax.Array, start: jax.Array) -> jax.Array:
+def _drift(x: jax.Array, start: jax.Array, shrink: jax.Array) -> jax.Array:
     """How far a search has travelled from its starting point, **in the baseline's coordinates**.
 
     Four of the five coordinates are the baseline's already -- ``b``, ``rho`` and ``sigma`` through
@@ -590,11 +597,47 @@ def _drift(x: jax.Array, start: jax.Array) -> jax.Array:
     if it is measured against the same ruler, which is the same argument the practical bounds are
     imported under.
 
+    **And in the slice's own units below the reference variance** (F3-W1), as the baseline's
+    ``_units`` does: the level's drift is divided by ``shrink`` and ``m``'s by its square root, so
+    the same ``ridge_bp`` is the same tie-breaker on a daily as on a week. ``b``, ``rho`` and
+    ``sigma`` are preimages that are already scale-free. ``shrink`` is one at and above the
+    reference, which leaves every longer slice's objective exactly as it was.
+
     Rescaling the *search* coordinate instead was tried and rejected: it fixes the ridge and
     wrecks the conditioning, because the level's gradient then dwarfs the other four and L-BFGS
     spends its linesearch on one direction.
     """
-    return jnp.concatenate([(_softplus(x[0]) - _softplus(start[0]))[None], x[1:] - start[1:]])
+    level = (_softplus(x[0]) - _softplus(start[0])) / shrink
+    one = jnp.ones_like(shrink)
+    units = jnp.stack([one, one, jnp.sqrt(shrink), one])
+    return jnp.concatenate([level[None], (x[1:] - start[1:]) / units])
+
+
+def _variance_scale(data: _Batch) -> jax.Array:
+    """One slice's own total variance ``W``: the weighted mean of ``vol^2 * T`` over its quotes.
+
+    The baseline's ``_variance_scale``, on a padded row: masked, so a reserved cell cannot move
+    it, and weighted by the same weights, so the two producers shrink their tuning by one ruler. A
+    fully padded row has no weight at all, and its scale is floored at :data:`W_FLOOR` rather than
+    divided by zero -- a NaN here would be every lane's NaN under ``vmap``, and the row is
+    discarded by the slice mask whatever it computes.
+    """
+    weights = jnp.where(data.quote_mask, data.weights, 0.0)
+    total_variance = data.implied_vol * data.implied_vol * data.tenor_years
+    mass = jnp.sum(weights)
+    mean = jnp.sum(weights * total_variance) / jnp.where(mass > 0.0, mass, 1.0)
+    return jnp.maximum(mean, W_FLOOR)
+
+
+def _shrink(data: _Batch) -> jax.Array:
+    """``min(1, W / REFERENCE_TOTAL_VARIANCE)``: how much smaller than a week this slice is.
+
+    The baseline's ``_shrink``, reference imported rather than restated for the reason the bounds
+    are: it is the ruler ``ridge_bp`` is read against, and two producers reading one setting
+    against two rulers would be two tunings wearing one name. One at and above the reference,
+    which leaves the start and the objective of every longer slice exactly where they were.
+    """
+    return jnp.minimum(1.0, _variance_scale(data) / REFERENCE_TOTAL_VARIANCE)
 
 
 def _quote_count(data: _Batch) -> jax.Array:
@@ -647,9 +690,12 @@ def _cold_start(data: _Batch) -> jax.Array:
     k_low = jnp.min(jnp.where(data.quote_mask, data.log_moneyness, k_high))
     span = k_high - k_low
 
+    # On a slice shorter than a week the curvature and the wing floor shrink with it, as
+    # log-moneyness does: by the square root of its share of the reference variance.
+    root = jnp.sqrt(_shrink(data))
     b = jnp.clip(
         jnp.where(span > 0.0, (w_high - w_low) / jnp.where(span > 0.0, span, 1.0), 0.0),
-        B_START_MIN,
+        B_START_MIN * root,
         B_MAX,
     )
     at_minimum = jnp.argmin(jnp.where(data.quote_mask, total_variance, w_high))
@@ -662,7 +708,7 @@ def _cold_start(data: _Batch) -> jax.Array:
             _inverse_softplus_jnp(b),
             jnp.arctanh(jnp.asarray(RHO_START / RHO_TANH_LIMIT, dtype=DTYPE)),
             m,
-            _inverse_softplus_jnp(jnp.asarray(SIGMA_START, dtype=DTYPE)),
+            _inverse_softplus_jnp(jnp.maximum(SIGMA_START * root, SIGMA_MIN)),
         ]
     )
 

@@ -28,6 +28,16 @@ the rest of the file buys: no mirror type, no second copy of the guards.
 What has *not* changed is that a file still cannot reach an object -- ``provider``, ``calibrators``
 and ``writer`` are names, resolved by a registry that lives elsewhere.
 
+**A fourth settings type is imported lazily, because its module needs an optional extra** (F3-W1).
+``JaxFitSettings`` lives beside the JAX calibrator, whose module imports ``jax`` at its top, so a
+top-level import here would make every configuration -- the walking skeleton's included -- need
+the ``jax`` extra just to be read. It is imported only when the file states ``[calibration.jax]``,
+and only after the extra has been found, so a file that asks for JAX tuning on an installation
+without JAX fails with a ``ConfigError`` naming the extra rather than with an ``ImportError``.
+
+**The metrics sink is chosen here too** (``[metrics]``, F3-W1): a name, like the adapters, and a
+path when the name is ``csv``. Which object that becomes, and who closes it, is the CLI's business.
+
 **Every adapter section is optional, and complete when present.** Absent means "the adapter's
 own defaults", which are argued for in its docstring and are what every test bends one knob of; a
 partial table would need this module to restate every value the file left out, which is the mirror
@@ -49,9 +59,10 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta
 from enum import StrEnum
+from importlib.util import find_spec
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from volengine.market_data.adapters.deribit_ws import DeribitSettings
 from volengine.market_data.adapters.synthetic import SVIParamsSpec, SyntheticConfig
@@ -73,6 +84,12 @@ from volengine.risk.domain.portfolio import Portfolio, Position
 from volengine.risk.domain.pricing import OptionKindR
 from volengine.risk.domain.valuation import BumpSpec
 from volengine.shared_kernel.domain.instants import require_aware
+
+if TYPE_CHECKING:
+    # The JAX calibrator's module imports `jax` at its top, and `jax` is an optional extra: the
+    # type is named here for the checker and imported at run time only by `_jax`, after the extra
+    # has been found (see the module docstring).
+    from volengine.parametric_pricing.adapters.jax_calibrator import JaxFitSettings
 
 
 class ConfigError(Exception):
@@ -99,6 +116,39 @@ and nobody reports.
 
 DERIBIT_PROVIDER = "deribit"
 """The second, on the same terms: ``[market.deribit]`` is refused beside any other provider."""
+
+JAX_CALIBRATOR = "svi-jax"
+"""The registry key of the JAX calibrator, spelled here rather than imported from its module.
+
+``jax_calibrator.PRODUCER_ID`` says the same thing and cannot be read without importing ``jax``,
+which is an optional extra -- so the registry would need the extra merely to list the names it
+knows. A test holds the two spellings together wherever the extra is installed.
+"""
+
+JAX_EXTRA_LIBRARIES = ("jax", "optax")
+"""What the ``jax`` extra installs, checked by name before anything that needs it is imported."""
+
+
+def require_jax_extra(where: str) -> None:
+    """Refuse, with the remedy, a configuration that needs JAX on an installation without it.
+
+    The one check behind both doors the extra can be asked for through: a ``[calibration.jax]``
+    table, which cannot be parsed into its type without importing it, and ``svi-jax`` in the
+    calibrator list, which cannot be built without it. Either way it is a start-up refusal naming
+    the extra and the command that installs it -- never an ``ImportError`` out of the first fit.
+
+    Args:
+        where: The table or the registry entry that asked, prefixed onto the message.
+
+    Raises:
+        ConfigError: If any library of the extra is missing.
+    """
+    missing = [name for name in JAX_EXTRA_LIBRARIES if find_spec(name) is None]
+    if missing:
+        raise ConfigError(
+            f"{where}: {JAX_CALIBRATOR!r} needs {', '.join(missing)}, which the 'jax' extra "
+            "installs: uv sync --extra jax"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -251,6 +301,21 @@ class CalibrationConfig:
     ``flat-vol`` takes no tuning at all, and a file running it alone says nothing here.
     """
 
+    jax: JaxFitSettings | None = None
+    """The JAX calibrator's tuning, from ``[calibration.jax]``, or ``None`` for its own defaults.
+
+    A table of its own rather than a widened ``[calibration.fit]``, as ADR-028 foresaw: the two
+    adapters share the loss's *definition* and nothing about how it is searched, so one table
+    would carry ``max_nfev`` for one producer and a learning rate for the other, each silently
+    ignoring half of it. The numbers that must agree for a comparison -- Huber scale, penalty,
+    ridge, pinning threshold -- carry the same names in both tables, and keeping them equal is the
+    file's job, which ``examples/svi-scipy-vs-jax.toml`` does.
+
+    The padded shape (``PadShape``) is deliberately not in it: it is the compiled signature, its
+    default reserves sixteen expiries of sixty-four strikes, and no configuration this build ships
+    needs another. A chain wider than that is refused per snapshot and republished (ADR-006).
+    """
+
     def __post_init__(self) -> None:
         if not self.calibrators:
             raise ValueError("At least one calibrator must be configured")
@@ -290,6 +355,50 @@ class RiskConfig:
             raise ValueError("The output_path must not be empty")
 
 
+class MetricsSinkKind(StrEnum):
+    """Where the engine's measurements go. Explicit values: they are what a file spells."""
+
+    LOGGING = "logging"
+    """One log line per measurement, at INFO, for a person watching a terminal."""
+
+    NULL = "null"
+    """Nowhere. What a run has always done when nobody asked."""
+
+    CSV = "csv"
+    """One row per measurement in a file, for a chart (``platform/adapters/csv_metrics_sink``)."""
+
+
+@dataclass(frozen=True, slots=True)
+class MetricsConfig:
+    """Which sink the measurements go to, and the file when the sink writes one.
+
+    A name rather than an object, like every adapter: the CLI turns it into a sink, because the
+    CSV one holds a file open and the code that opens a file is the code that has to close it --
+    the ``MetricsSink`` port has no ``close()`` and is not given one.
+    """
+
+    sink: MetricsSinkKind = MetricsSinkKind.NULL
+    """The sink. ``null`` is the default because it is what a run without ``[metrics]`` and
+    without ``--metrics`` has always done."""
+
+    path: Path | None = None
+    """The file, required for ``csv`` and refused for the other two.
+
+    Refused rather than ignored, unlike ``RiskConfig.output_path`` beside a console writer: here
+    the type knows which sink writes a file, so a path given to one that does not is a file the
+    operator expects to find and never will. Read as written, relative to the working directory,
+    and appended to (``CsvMetricsSink``).
+    """
+
+    def __post_init__(self) -> None:
+        if self.sink is MetricsSinkKind.CSV and self.path is None:
+            raise ValueError("The 'csv' metrics sink needs a 'path' naming the file to write")
+        if self.sink is not MetricsSinkKind.CSV and self.path is not None:
+            raise ValueError(
+                f"A path was given to the {self.sink.value!r} metrics sink, which writes no file"
+            )
+
+
 @dataclass(frozen=True, slots=True)
 class AppConfig:
     """One file, one engine: every market it runs and the two consumers behind them."""
@@ -309,6 +418,10 @@ class AppConfig:
 
     risk: RiskConfig
     """Shared by every market, for the same reason: one book valued the same way everywhere."""
+
+    metrics: MetricsConfig = MetricsConfig()
+    """Where measurements go. Absent ``[metrics]`` is the null sink, which is what every run did
+    before the table existed; the CLI's ``--metrics``/``--no-metrics`` overrides it."""
 
     def __post_init__(self) -> None:
         if not self.markets:
@@ -350,6 +463,7 @@ def load_config(path: Path) -> AppConfig:
             ),
             calibration=_calibration(_table(raw, "calibration", "the file")),
             risk=_risk(_table(raw, "risk", "the file")),
+            metrics=_metrics(raw),
         ),
     )
 
@@ -546,6 +660,7 @@ def _calibration(raw: Mapping[str, Any]) -> CalibrationConfig:
                 ),
             ),
             fit=_fit(raw, where),
+            jax=_jax(raw, where),
         ),
     )
 
@@ -566,6 +681,56 @@ def _fit(raw: Mapping[str, Any], where: str) -> FitSettings | None:
             min_quotes_for_free_shape=_integer(settings, "min_quotes_for_free_shape", place),
             ridge_bp=_number(settings, "ridge_bp", place),
             max_nfev=_integer(settings, "max_nfev", place),
+        ),
+    )
+
+
+def _jax(raw: Mapping[str, Any], where: str) -> JaxFitSettings | None:
+    """The JAX calibrator's tuning, when the file states it -- complete, like ``[calibration.fit]``.
+
+    The extra is checked before the import, so the failure on an installation without JAX is the
+    ``ConfigError`` naming it. That holds even when ``--calibrators`` would later narrow the run to
+    another producer: the file is read whole before any flag is applied, and a table that cannot be
+    parsed is refused rather than skipped, because skipping it would be a block of numbers nobody
+    reads and nobody reports.
+    """
+    settings = _optional_table(raw, "jax", where)
+    if settings is None:
+        return None
+    place = f"{where}.jax"
+    require_jax_extra(place)
+    # Imported here and not at the top: the module imports `jax`, an optional extra, and the
+    # check above is what turns its absence into a message instead of an `ImportError`.
+    from volengine.parametric_pricing.adapters.jax_calibrator import JaxFitSettings
+
+    return _built(
+        place,
+        lambda: JaxFitSettings(
+            huber_scale_bp=_number(settings, "huber_scale_bp", place),
+            durrleman_penalty_bp=_number(settings, "durrleman_penalty_bp", place),
+            durrleman_mesh_margin=_number(settings, "durrleman_mesh_margin", place),
+            ridge_bp=_number(settings, "ridge_bp", place),
+            min_quotes_for_free_shape=_integer(settings, "min_quotes_for_free_shape", place),
+            learning_rate=_number(settings, "learning_rate", place),
+            hot_steps=_integer(settings, "hot_steps", place),
+            cold_steps=_integer(settings, "cold_steps", place),
+            tolerance_bp=_number(settings, "tolerance_bp", place),
+            linesearch_steps=_integer(settings, "linesearch_steps", place),
+        ),
+    )
+
+
+def _metrics(raw: Mapping[str, Any]) -> MetricsConfig:
+    """``[metrics]``, or the null sink when the file has no such table."""
+    settings = _optional_table(raw, "metrics", "the file")
+    if settings is None:
+        return MetricsConfig()
+    where = "metrics"
+    return _built(
+        where,
+        lambda: MetricsConfig(
+            sink=_member(settings, "sink", where, MetricsSinkKind),
+            path=_optional_path(settings, "path", where),
         ),
     )
 

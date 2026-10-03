@@ -3,27 +3,37 @@
 Driven through typer's own runner, so what is asserted is what a person would see -- an exit code
 and a line on stderr -- rather than the return value of a function nobody calls that way.
 
-``run`` and ``report`` are not exercised to completion here: the file every test below starts
-from names ``svi-jax``, which is F3-A's calibrator and which no adapter is registered for, so
-those two paths stop at the registry. That is deliberate -- the tests pin the *message* it fails
-with, because "no calibrator adapter is registered under 'svi-jax'" is the difference between a
-five-second fix and an afternoon. The graph those commands build is covered against fakes in
-``test_pipeline.py``, the run that reaches a report in ``test_walking_skeleton.py``, and the one
-that reaches it through a fit in ``test_synthetic_vertical.py``.
+``run`` and ``report`` are mostly not exercised to completion here: the file every test below
+starts from names ``svi-unregistered``, which no adapter is registered for, so those two paths stop
+at the registry. That is deliberate -- the tests pin the *message* it fails with, because "no
+calibrator adapter is registered under 'svi-unregistered'" is the difference between a five-second
+fix and an afternoon. The exception is the metrics sink's lifetime (F3-W1), which is the CLI's own
+and is asserted on a run that reaches its end -- or is made to fail on the way. The graph those
+commands build is covered against fakes in ``test_pipeline.py``, the run that reaches a report in
+``test_walking_skeleton.py``, and the one that reaches it through a fit in
+``test_synthetic_vertical.py``.
 """
 
 from __future__ import annotations
 
+import csv
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 from typer.testing import CliRunner
 
 from tests.entrypoints.builders import CONFIG_TOML, replacing, write_config
+from volengine.entrypoints import cli
 from volengine.entrypoints.cli import app
+from volengine.entrypoints.config import AppConfig
+from volengine.entrypoints.pipeline import Adapters
 from volengine.market_data.adapters.recorded import open_recording
 from volengine.parametric_pricing.adapters.flat_vol import PRODUCER_ID
+from volengine.platform.adapters.csv_metrics_sink import CsvMetricsSink
+from volengine.platform.clock import Clock
+from volengine.platform.metrics import MetricsSink
 
 runner = CliRunner()
 
@@ -121,11 +131,11 @@ def test_a_configured_market_gets_past_the_selection(tmp_path: Path) -> None:
 
 def test_an_unknown_calibrator_lists_the_ones_configured(tmp_path: Path) -> None:
     code, output = invoke(
-        "run", "--config", str(write_config(tmp_path)), "--calibrators", "svi-jax"
+        "run", "--config", str(write_config(tmp_path)), "--calibrators", "svi-scipy"
     )
 
     assert code == 2
-    assert "svi-jax" in output
+    assert "svi-unregistered" in output
 
 
 def test_an_empty_calibrator_flag_is_refused(tmp_path: Path) -> None:
@@ -141,8 +151,8 @@ def test_an_empty_calibrator_flag_is_refused(tmp_path: Path) -> None:
 def runnable(directory: Path) -> Path:
     """The same file, naming adapters this build registers and a position it can value.
 
-    ``CONFIG_TOML`` names ``svi-jax`` on purpose, which is what makes the tests above stop at the
-    registry. The two verbs below have to reach the end of a session instead, so they get the
+    ``CONFIG_TOML`` names ``svi-unregistered`` on purpose, which is what makes the tests above stop
+    at the registry. The two verbs below have to reach the end of a session instead, so they get the
     walking skeleton's three adapters and an expiry inside the tenors the constant feed quotes.
     """
     text = replacing(CONFIG_TOML, "calibrators", f'calibrators = ["{PRODUCER_ID}"]')
@@ -282,3 +292,153 @@ def test_every_verb_the_design_names_is_declared() -> None:
     _, output = invoke("--help")
 
     assert all(verb in output for verb in ("run", "report", "record", "replay"))
+
+
+# --- the metrics sink (F3-W1)
+
+
+class ClosingSpy(CsvMetricsSink):
+    """The real CSV sink, remembering whether the CLI closed it.
+
+    The port has no ``close()`` and the file handle is the sink's own, so "the composition root
+    closed the file" is only observable from inside: every instance the CLI builds is kept, and
+    each records the call that ends it.
+    """
+
+    built: ClassVar[list[ClosingSpy]] = []
+
+    def __init__(self, path: Path, clock: Clock) -> None:
+        super().__init__(path, clock)
+        self.closed = False
+        ClosingSpy.built.append(self)
+
+    def close(self) -> None:
+        self.closed = True
+        super().close()
+
+
+@pytest.fixture
+def spy(monkeypatch: pytest.MonkeyPatch) -> list[ClosingSpy]:
+    """Every CSV sink the CLI opens during one test, in order."""
+    ClosingSpy.built = []
+    monkeypatch.setattr(cli, "CsvMetricsSink", ClosingSpy)
+    return ClosingSpy.built
+
+
+def with_csv_metrics(config: Path, metrics: Path) -> Path:
+    """The same file, with ``[metrics]`` choosing the CSV sink on ``metrics``."""
+    text = config.read_text(encoding="utf-8")
+    config.write_text(f'{text}\n[metrics]\nsink = "csv"\npath = "{metrics}"\n', encoding="utf-8")
+    return config
+
+
+def rows_of(path: Path) -> list[dict[str, str]]:
+    return list(csv.DictReader(path.read_text(encoding="utf-8").splitlines()))
+
+
+def test_a_run_under_the_csv_sink_leaves_a_closed_complete_file(
+    tmp_path: Path, spy: list[ClosingSpy]
+) -> None:
+    """The file ``[metrics]`` names holds the session's measurements, and was closed, not abandoned.
+
+    "Complete" is asserted on the series the run had to emit to produce its report -- a snapshot
+    published, a surface received -- and on every row parsing, which a buffer cut mid-row would
+    break.
+    """
+    metrics = tmp_path / "metrics.csv"
+    config = with_csv_metrics(runnable(tmp_path), metrics)
+
+    code, output = invoke("report", "--config", str(config), "--count", "1")
+
+    assert code == 0, output
+    assert [one.closed for one in spy] == [True]
+    names = {row["name"] for row in rows_of(metrics)}
+    assert {"marketdata.snapshot.published", "risk.surface.received"} <= names
+
+
+def test_a_run_that_ends_in_an_exception_still_closes_its_metrics_file(
+    tmp_path: Path, spy: list[ClosingSpy], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The exit path a ``finally`` exists for: the run raises, and the rows written before it stay.
+
+    The pipeline is replaced by one that measures something and then fails, which is the shape of
+    every real failure -- a provider that cannot connect, a chain fed another market's quotes --
+    without depending on any of them.
+    """
+
+    class FailingPipeline:
+        def __init__(self, sink: MetricsSink) -> None:
+            self._sink = sink
+
+        async def run(
+            self, max_reports: int | None = None, duration_seconds: float | None = None
+        ) -> None:
+            self._sink.counter("test.before_the_failure")
+            raise RuntimeError("the feed fell over")
+
+    def failing_build(
+        config: AppConfig,
+        adapters: Adapters,
+        clock: Clock,
+        bus: object,
+        metrics: MetricsSink,
+        *,
+        timers: bool = True,
+    ) -> FailingPipeline:
+        return FailingPipeline(metrics)
+
+    monkeypatch.setattr(cli, "build_pipeline", failing_build)
+    metrics = tmp_path / "metrics.csv"
+    config = with_csv_metrics(runnable(tmp_path), metrics)
+
+    result = runner.invoke(app, ["run", "--config", str(config)])
+
+    assert isinstance(result.exception, RuntimeError)
+    assert [one.closed for one in spy] == [True]
+    assert [row["name"] for row in rows_of(metrics)] == ["test.before_the_failure"]
+
+
+def test_a_refused_configuration_still_closes_the_metrics_file_it_opened(
+    tmp_path: Path, spy: list[ClosingSpy]
+) -> None:
+    """The sink opens before the registry is consulted, so a refusal there exits through it."""
+    metrics = tmp_path / "metrics.csv"
+
+    code, _ = invoke("run", "--config", str(with_csv_metrics(write_config(tmp_path), metrics)))
+
+    assert code == 2
+    assert [one.closed for one in spy] == [True]
+
+
+@pytest.mark.parametrize("flag", ["--metrics", "--no-metrics"])
+def test_the_command_line_overrides_the_metrics_table(
+    tmp_path: Path, spy: list[ClosingSpy], flag: str
+) -> None:
+    """Either spelling wins over ``[metrics]``, so the file the table names is never opened."""
+    metrics = tmp_path / "metrics.csv"
+    config = with_csv_metrics(write_config(tmp_path), metrics)
+
+    code, _ = invoke("run", "--config", str(config), flag)
+
+    assert code == 2
+    assert spy == []
+    assert not metrics.exists()
+
+
+def test_without_a_flag_the_metrics_table_is_obeyed(tmp_path: Path, spy: list[ClosingSpy]) -> None:
+    """The guard on the test above: the same file, no flag, and the CSV is opened."""
+    metrics = tmp_path / "metrics.csv"
+
+    invoke("run", "--config", str(with_csv_metrics(write_config(tmp_path), metrics)))
+
+    assert len(spy) == 1
+    assert metrics.exists()
+
+
+def test_a_metrics_file_that_cannot_be_written_is_a_configuration_error(tmp_path: Path) -> None:
+    metrics = tmp_path / "no-such-directory" / "metrics.csv"
+
+    code, output = invoke("run", "--config", str(with_csv_metrics(write_config(tmp_path), metrics)))
+
+    assert code == 2
+    assert "metrics: cannot write" in output

@@ -10,12 +10,21 @@ operator has no reason to be reading.
 from __future__ import annotations
 
 from datetime import UTC, datetime, time, timedelta
+from importlib.util import find_spec
 from pathlib import Path
 
 import pytest
 
 from tests.entrypoints.builders import CONFIG_TOML, replacing, without, write_config
-from volengine.entrypoints.config import AppConfig, ConfigError, load_config
+from volengine.entrypoints import config as config_module
+from volengine.entrypoints.config import (
+    JAX_EXTRA_LIBRARIES,
+    AppConfig,
+    ConfigError,
+    MetricsConfig,
+    MetricsSinkKind,
+    load_config,
+)
 from volengine.market_data.adapters.deribit_ws import DeribitSettings
 from volengine.market_data.adapters.synthetic import SVIParamsSpec
 from volengine.market_data.domain.market_conventions import DayCount, ForwardMethod, Numeraire
@@ -489,3 +498,140 @@ def test_a_rediscovery_cadence_that_could_not_be_polled_on_is_refused(
 
     with pytest.raises(ConfigError, match="rediscovery_seconds must be positive and finite"):
         load(tmp_path, text)
+
+
+# --- the JAX calibrator's table (F3-W1)
+
+
+JAX_TOML = """
+[calibration.jax]
+huber_scale_bp = 80.0
+durrleman_penalty_bp = 5000.0
+durrleman_mesh_margin = 0.25
+ridge_bp = 1.0
+min_quotes_for_free_shape = 4
+learning_rate = 0.02
+hot_steps = 150
+cold_steps = 120
+tolerance_bp = 0.01
+linesearch_steps = 9
+"""
+"""Every value differs from ``JaxFitSettings``'s own default, so an assertion on one of them cannot
+pass on a table that was never read."""
+
+HAS_JAX_EXTRA = all(find_spec(name) is not None for name in JAX_EXTRA_LIBRARIES)
+
+
+def hide(monkeypatch: pytest.MonkeyPatch, library: str) -> None:
+    """Make the loader's extra check see an installation without ``library``.
+
+    Patched on the loader's own name for the lookup, so the refusal is observable on every
+    installation rather than only on the CI leg that happens to lack the extra.
+    """
+    monkeypatch.setattr(
+        config_module, "find_spec", lambda name: None if name == library else find_spec(name)
+    )
+
+
+@pytest.mark.skipif(not HAS_JAX_EXTRA, reason="needs the jax extra")
+def test_the_jax_table_fills_the_calibrator_own_type(tmp_path: Path) -> None:
+    """No mirror type: the file builds the ``JaxFitSettings`` the adapter itself declares."""
+    jax_calibrator = pytest.importorskip("volengine.parametric_pricing.adapters.jax_calibrator")
+
+    settings = load(tmp_path, CONFIG_TOML + JAX_TOML).calibration.jax
+
+    assert settings == jax_calibrator.JaxFitSettings(
+        huber_scale_bp=80.0,
+        durrleman_penalty_bp=5000.0,
+        durrleman_mesh_margin=0.25,
+        ridge_bp=1.0,
+        min_quotes_for_free_shape=4,
+        learning_rate=0.02,
+        hot_steps=150,
+        cold_steps=120,
+        tolerance_bp=0.01,
+        linesearch_steps=9,
+    )
+
+
+def test_a_file_with_no_jax_table_leaves_the_tuning_absent(tmp_path: Path) -> None:
+    assert load(tmp_path).calibration.jax is None
+
+
+def test_a_file_with_no_jax_table_is_read_without_the_extra(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The guard on the test below: the extra is asked for by the table, not by every file read."""
+    hide(monkeypatch, "jax")
+
+    assert load(tmp_path).calibration.jax is None
+
+
+def test_a_jax_table_without_the_extra_is_refused_with_the_remedy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``ConfigError`` naming the table and the extra, never an ``ImportError``."""
+    hide(monkeypatch, "jax")
+
+    with pytest.raises(ConfigError, match=r"calibration\.jax: .*uv sync --extra jax"):
+        load(tmp_path, CONFIG_TOML + JAX_TOML)
+
+
+@pytest.mark.skipif(not HAS_JAX_EXTRA, reason="needs the jax extra")
+def test_a_missing_key_in_the_jax_table_names_the_table(tmp_path: Path) -> None:
+    """Complete when present, like ``[calibration.fit]``."""
+    with pytest.raises(ConfigError, match=r"calibration\.jax: the key 'hot_steps'"):
+        load(tmp_path, without(CONFIG_TOML + JAX_TOML, "hot_steps"))
+
+
+@pytest.mark.skipif(not HAS_JAX_EXTRA, reason="needs the jax extra")
+def test_a_jax_value_the_calibrator_refuses_is_blamed_on_its_table(tmp_path: Path) -> None:
+    text = replacing(CONFIG_TOML + JAX_TOML, "learning_rate", "learning_rate = 0.0")
+
+    with pytest.raises(ConfigError, match=r"calibration\.jax: The learning rate"):
+        load(tmp_path, text)
+
+
+# --- the metrics sink (F3-W1)
+
+
+def with_metrics(table: str) -> str:
+    return CONFIG_TOML + "\n[metrics]\n" + table + "\n"
+
+
+def test_a_file_with_no_metrics_table_gets_the_null_sink(tmp_path: Path) -> None:
+    """Absent is what every run did before the table existed: nothing recorded."""
+    assert load(tmp_path).metrics == MetricsConfig(sink=MetricsSinkKind.NULL)
+
+
+def test_the_csv_sink_is_read_with_its_path(tmp_path: Path) -> None:
+    metrics = load(tmp_path, with_metrics('sink = "csv"\npath = "out/metrics.csv"')).metrics
+
+    assert metrics.sink is MetricsSinkKind.CSV
+    assert metrics.path == Path("out/metrics.csv")
+
+
+def test_the_logging_sink_takes_no_path(tmp_path: Path) -> None:
+    assert load(tmp_path, with_metrics('sink = "logging"')).metrics.sink is MetricsSinkKind.LOGGING
+
+
+def test_a_csv_sink_with_nowhere_to_write_is_refused(tmp_path: Path) -> None:
+    with pytest.raises(ConfigError, match="metrics: The 'csv' metrics sink needs a 'path'"):
+        load(tmp_path, with_metrics('sink = "csv"'))
+
+
+@pytest.mark.parametrize("sink", ["logging", "null"])
+def test_a_path_given_to_a_sink_that_writes_no_file_is_refused(tmp_path: Path, sink: str) -> None:
+    """Refused rather than ignored: a path is a file the operator expects to find afterwards."""
+    with pytest.raises(ConfigError, match="writes no file"):
+        load(tmp_path, with_metrics(f'sink = "{sink}"\npath = "metrics.csv"'))
+
+
+def test_an_unknown_sink_lists_the_three_there_are(tmp_path: Path) -> None:
+    with pytest.raises(ConfigError, match="logging, null, csv"):
+        load(tmp_path, with_metrics('sink = "prometheus"'))
+
+
+def test_a_blank_metrics_path_is_refused_by_name(tmp_path: Path) -> None:
+    with pytest.raises(ConfigError, match="metrics: 'path' must not be empty"):
+        load(tmp_path, with_metrics('sink = "csv"\npath = " "'))

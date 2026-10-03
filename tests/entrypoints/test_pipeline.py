@@ -17,6 +17,7 @@ import threading
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
+from dataclasses import replace
 from datetime import timedelta
 from importlib.util import find_spec
 from pathlib import Path
@@ -26,6 +27,8 @@ import pytest
 from tests.entrypoints.builders import (
     CALIBRATOR_NAME,
     MARKET_ID,
+    PROVIDER_NAME,
+    WRITER_NAME,
     BlockingProvider,
     RecordingBus,
     RecordingWriter,
@@ -62,8 +65,10 @@ from volengine.contracts.events import (
     SnapshotReady,
     SurfaceCalibrated,
 )
+from volengine.entrypoints import config as config_module
 from volengine.entrypoints.config import (
     DERIBIT_PROVIDER,
+    JAX_CALIBRATOR,
     SYNTHETIC_PROVIDER,
     AppConfig,
     ConfigError,
@@ -485,7 +490,8 @@ def test_a_market_with_nothing_in_the_book_is_refused() -> None:
 
 
 def test_the_default_registry_holds_every_adapter_this_build_can_make() -> None:
-    """The seven names a shipped configuration may use: F1-08's three, F2's three, F3-C's venue.
+    """The eight names a shipped configuration may use: F1-08's three, F2's three, F3-C's venue and
+    F3-W1's JAX calibrator.
 
     Names rather than objects: the factories are what ``build_pipeline`` calls, and asserting on
     what they build here would only repeat the end-to-end tests in ``test_walking_skeleton.py``
@@ -495,7 +501,7 @@ def test_the_default_registry_holds_every_adapter_this_build_can_make() -> None:
     adapters = default_adapters()
 
     assert set(adapters.providers) == {"constant", "synthetic", "deribit"}
-    assert set(adapters.calibrators) == {"flat-vol", "svi-scipy"}
+    assert set(adapters.calibrators) == {"flat-vol", "svi-scipy", "svi-jax"}
     assert set(adapters.writers) == {"console", "csv"}
 
 
@@ -603,6 +609,90 @@ def test_a_calibrator_with_no_fit_table_keeps_the_settings_it_ships_with() -> No
 
     assert isinstance(calibrator, ScipyCalibrator)
     assert calibrator.settings == FitSettings()
+
+
+HAS_JAX_EXTRA = all(find_spec(name) is not None for name in ("jax", "optax"))
+
+
+@pytest.mark.skipif(not HAS_JAX_EXTRA, reason="needs the jax extra")
+def test_the_registry_key_is_the_name_the_jax_calibrator_gives_itself() -> None:
+    """Spelled twice -- once where the registry can read it without ``jax`` -- and held together
+    here, because a mismatch would publish ``svi-jax``'s surfaces under a topic the file never
+    named."""
+    jax_calibrator = pytest.importorskip("volengine.parametric_pricing.adapters.jax_calibrator")
+
+    assert jax_calibrator.PRODUCER_ID == JAX_CALIBRATOR
+
+
+@pytest.mark.skipif(not HAS_JAX_EXTRA, reason="needs the jax extra")
+def test_the_jax_calibrator_is_handed_the_tuning_the_file_states() -> None:
+    """``[calibration.jax]`` reaches the optimiser, rather than being parsed and dropped."""
+    jax_calibrator = pytest.importorskip("volengine.parametric_pricing.adapters.jax_calibrator")
+    settings = jax_calibrator.JaxFitSettings(hot_steps=7)
+
+    calibrator = default_adapters().calibrators[JAX_CALIBRATOR](
+        replace(make_calibration_config(calibrators=(JAX_CALIBRATOR,)), jax=settings)
+    )
+
+    assert isinstance(calibrator, jax_calibrator.JaxCalibrator)
+    assert calibrator.settings == settings
+    assert calibrator.producer_id == JAX_CALIBRATOR
+
+
+@pytest.mark.skipif(not HAS_JAX_EXTRA, reason="needs the jax extra")
+def test_a_jax_calibrator_with_no_table_keeps_the_settings_it_ships_with() -> None:
+    jax_calibrator = pytest.importorskip("volengine.parametric_pricing.adapters.jax_calibrator")
+
+    calibrator = default_adapters().calibrators[JAX_CALIBRATOR](
+        make_calibration_config(calibrators=(JAX_CALIBRATOR,))
+    )
+
+    assert isinstance(calibrator, jax_calibrator.JaxCalibrator)
+    assert calibrator.settings == jax_calibrator.JaxFitSettings()
+
+
+def test_a_jax_calibrator_without_the_extra_is_refused_with_the_remedy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """At wiring time, naming the extra -- not an ``ImportError`` out of the first fit.
+
+    Run on every installation by hiding the extra from the one lookup the check makes, rather than
+    only on the CI leg that lacks it: the refusal is the behaviour, and it should not need a second
+    environment to be seen.
+    """
+    monkeypatch.setattr(
+        config_module, "find_spec", lambda name: None if name == "jax" else find_spec(name)
+    )
+
+    with pytest.raises(ConfigError, match="uv sync --extra jax"):
+        default_adapters().calibrators[JAX_CALIBRATOR](
+            make_calibration_config(calibrators=(JAX_CALIBRATOR,))
+        )
+
+
+def test_the_whole_pipeline_refuses_svi_jax_without_the_extra_before_anything_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The same refusal through ``build_pipeline``: a ``ConfigError``, so the CLI exits with 2."""
+    monkeypatch.setattr(
+        config_module, "find_spec", lambda name: None if name == "optax" else find_spec(name)
+    )
+    config = make_app_config(calibration=make_calibration_config(calibrators=(JAX_CALIBRATOR,)))
+
+    registry = replace(
+        default_adapters(),
+        providers={PROVIDER_NAME: lambda _market: StubProvider(updates=())},
+        writers={WRITER_NAME: lambda _risk: RecordingWriter()},
+    )
+
+    with pytest.raises(ConfigError, match=r"'svi-jax' needs (jax, )?optax"):
+        build_pipeline(
+            config,
+            registry,
+            ManualClock(NOW),
+            InProcessConflatingBus(RecordingMetrics()),
+            RecordingMetrics(),
+        )
 
 
 def test_the_csv_writer_refuses_to_be_built_without_a_path() -> None:

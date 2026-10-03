@@ -16,6 +16,13 @@ from ``--market`` and ``replay`` from the market the file says it holds, and bot
 than guess when the choice is ambiguous. One file per market is what keeps the format free of a
 routing field nothing would read, and it is the shape a golden fixture takes anyway: an hour of one
 venue's chain.
+
+**The metrics sink is opened and closed here** (F3-W1). ``[metrics]`` names it, ``--metrics`` and
+``--no-metrics`` override the name, and :func:`_metrics_sink` turns the choice into an object. The
+CSV sink holds a file open and the ``MetricsSink`` port has no ``close()`` -- deliberately, since a
+use case has no business ending a run -- so the code that opens the file is the code that closes
+it, in a context manager wrapped around the whole of :func:`_drive`: a clean end, a refused
+configuration, an interrupt and an exception out of the run all leave a closed, complete file.
 """
 
 from __future__ import annotations
@@ -23,13 +30,21 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from typing import Annotated, NoReturn
 
 import typer
 
-from volengine.entrypoints.config import AppConfig, ConfigError, load_config
+from volengine.entrypoints.config import (
+    AppConfig,
+    ConfigError,
+    MetricsConfig,
+    MetricsSinkKind,
+    load_config,
+)
 from volengine.entrypoints.pipeline import (
     Adapters,
     build_pipeline,
@@ -38,6 +53,7 @@ from volengine.entrypoints.pipeline import (
     with_replay,
 )
 from volengine.market_data.adapters.recorded import Recording, open_recording
+from volengine.platform.adapters.csv_metrics_sink import CsvMetricsSink
 from volengine.platform.bus import InProcessConflatingBus
 from volengine.platform.clock import Clock, SimulatedClock, SystemClock
 from volengine.platform.metrics import LoggingMetricsSink, MetricsSink, NullMetricsSink
@@ -69,13 +85,18 @@ CalibratorsOption = Annotated[
     str | None,
     # The example was `svi,neural` in Design 8.1 until the neural producer turned out not to be
     # wired into the pipeline (docs/SEAMS.md): a help line promising a name the engine cannot
-    # build is worse than one that names what the shipped configuration actually lists.
-    typer.Option("--calibrators", help="Comma-separated producers to run, e.g. svi-scipy."),
+    # build is worse than one that names what the shipped configurations actually list.
+    typer.Option("--calibrators", help="Comma-separated producers to run, e.g. svi-scipy,svi-jax."),
 ]
 MetricsOption = Annotated[
-    bool,
-    typer.Option("--metrics/--no-metrics", help="Log every metric the contexts emit."),
+    bool | None,
+    typer.Option(
+        "--metrics/--no-metrics",
+        help="Log every metric, or none, whatever the file's metrics table chooses.",
+    ),
 ]
+"""Three states, not two: absent leaves the choice to the file's ``[metrics]`` table, and either
+spelling overrides it -- the way ``--market`` and ``--calibrators`` narrow theirs."""
 DurationOption = Annotated[
     float | None,
     typer.Option("--duration", help="Stop after this many seconds of session."),
@@ -91,7 +112,7 @@ def run(
     config: ConfigOption,
     market: MarketOption = None,
     calibrators: CalibratorsOption = None,
-    metrics: MetricsOption = False,
+    metrics: MetricsOption = None,
     duration: DurationOption = None,
 ) -> None:
     """Ingest, calibrate and report until the streams end, the duration elapses or you interrupt.
@@ -122,7 +143,7 @@ def report(
     config: ConfigOption,
     market: MarketOption = None,
     calibrators: CalibratorsOption = None,
-    metrics: MetricsOption = False,
+    metrics: MetricsOption = None,
     count: Annotated[int, typer.Option(help="Stop after this many reports.")] = 1,
 ) -> None:
     """Run the pipeline only until it has valued the book, then stop.
@@ -143,7 +164,7 @@ def record(
     recording: RecordingOption,
     market: MarketOption = None,
     calibrators: CalibratorsOption = None,
-    metrics: MetricsOption = False,
+    metrics: MetricsOption = None,
     duration: DurationOption = None,
 ) -> None:
     """Run a session normally and write its normalised quote stream to a file (ADR-004).
@@ -173,7 +194,7 @@ def replay(
     config: ConfigOption,
     recording: RecordingOption,
     calibrators: CalibratorsOption = None,
-    metrics: MetricsOption = False,
+    metrics: MetricsOption = None,
     count: Annotated[int | None, typer.Option(help="Stop after this many reports.")] = None,
 ) -> None:
     """Replay a recorded session through the whole engine, deterministically (ADR-004).
@@ -250,7 +271,10 @@ def _only_market(config: AppConfig, market_id: str) -> AppConfig:
     if not selected:
         known = ", ".join(one.market_id for one in config.markets)
         raise ConfigError(f"no market named {market_id!r} is configured; known: {known}")
-    return AppConfig(markets=selected, calibration=config.calibration, risk=config.risk)
+    # `replace` rather than a fresh `AppConfig(...)`: a constructor call names every field it keeps,
+    # and the one it forgets -- `metrics`, the day it arrived -- would silently fall back to its
+    # default.
+    return replace(config, markets=selected)
 
 
 def _only_calibrators(config: AppConfig, names: str) -> AppConfig:
@@ -261,11 +285,7 @@ def _only_calibrators(config: AppConfig, names: str) -> AppConfig:
     if unknown:
         known = ", ".join(config.calibration.calibrators)
         raise ConfigError(f"no calibrator named {unknown[0]!r} is configured; known: {known}")
-    return AppConfig(
-        markets=config.markets,
-        calibration=replace(config.calibration, calibrators=wanted),
-        risk=config.risk,
-    )
+    return replace(config, calibration=replace(config.calibration, calibrators=wanted))
 
 
 def _one_market(config: AppConfig, verb: str) -> AppConfig:
@@ -320,7 +340,7 @@ def _require_same_underlying(config: AppConfig, recording: Recording) -> None:
 
 def _drive(
     config: AppConfig,
-    metrics: bool,
+    metrics: bool | None,
     max_reports: int | None,
     duration: float | None = None,
     adapters: Adapters | None = None,
@@ -332,34 +352,79 @@ def _drive(
     ``timers=False`` is the replay's: no heartbeat task and no rediscovery poll, with the snapshot
     policy left exactly as the file states it (``pipeline.build_pipeline`` says why).
 
-    The one place in the engine that configures ``logging``, and it does so only for ``--metrics``.
-    ``LoggingMetricsSink`` emits at INFO and an unconfigured root logger drops everything below
-    WARNING, so without this line the flag would run the whole session and print nothing --
+    ``metrics`` is the command line's override of ``[metrics]``, or ``None`` to take the file's
+    choice. The sink is opened before the pipeline is built and closed after the run whatever
+    ended it (:func:`_metrics_sink`). The clock is resolved first because a CSV row is stamped by
+    the engine's own clock, so a replay's metrics carry recorded time (ADR-004).
+    """
+    engine_clock = clock if clock is not None else SystemClock()
+    with _metrics_sink(_metrics_choice(config.metrics, metrics), engine_clock) as sink:
+        bus = InProcessConflatingBus(sink)
+        try:
+            pipeline = build_pipeline(
+                config,
+                adapters if adapters is not None else default_adapters(),
+                engine_clock,
+                bus,
+                sink,
+                timers=timers,
+            )
+        except ConfigError as failure:
+            _fail(str(failure), CONFIG_EXIT_CODE)
+        try:
+            asyncio.run(pipeline.run(max_reports=max_reports, duration_seconds=duration))
+        except KeyboardInterrupt:  # pragma: no cover - requires a real signal
+            # An interrupt is how a session is meant to end, so it is not a traceback.
+            # `asyncio.run` has already cancelled the tasks, which is what closes the providers.
+            typer.echo("interrupted", err=True)
+
+
+def _metrics_choice(configured: MetricsConfig, flag: bool | None) -> MetricsConfig:
+    """The file's ``[metrics]``, unless ``--metrics`` or ``--no-metrics`` says otherwise.
+
+    The flag overrides rather than combines: ``--metrics`` beside ``sink = "csv"`` logs instead of
+    writing, because one sink per run is what the port carries and a person who typed the flag
+    wants to *see* the numbers now. A file's CSV is therefore one flag away from being suppressed,
+    and that is the precedence every other flag here has over the file.
+    """
+    if flag is None:
+        return configured
+    return MetricsConfig(sink=MetricsSinkKind.LOGGING if flag else MetricsSinkKind.NULL)
+
+
+@contextmanager
+def _metrics_sink(choice: MetricsConfig, clock: Clock) -> Iterator[MetricsSink]:
+    """The sink a run reports through, closed when the run ends -- however it ends.
+
+    The one place in the engine that configures ``logging``, and it does so only for the logging
+    sink. ``LoggingMetricsSink`` emits at INFO and an unconfigured root logger drops everything
+    below WARNING, so without this line the choice would run the whole session and print nothing --
     a switch that reports success by staying silent. Nothing below this layer may touch logging at
     all (the domain has ``MetricsSink`` instead), which is what makes one call here sufficient.
+
+    The CSV sink is opened here and closed in the ``finally``, which a ``typer.Exit`` from a
+    refused configuration, an exception out of the run and a clean return all pass through: the
+    file is flushed and released on every path, rather than left to the garbage collector with
+    its buffered tail. A path that cannot be opened is the operator's mistake and exits with the
+    configuration code, naming the path.
     """
-    sink: MetricsSink = NullMetricsSink()
-    if metrics:
+    if choice.sink is MetricsSinkKind.LOGGING:
         logging.basicConfig(level=logging.INFO, format="%(message)s")
-        sink = LoggingMetricsSink()
-    bus = InProcessConflatingBus(sink)
+        yield LoggingMetricsSink()
+        return
+    if choice.sink is MetricsSinkKind.NULL or choice.path is None:
+        # `path is None` cannot happen for a CSV choice -- `MetricsConfig` refuses it -- and is
+        # spelled here only so the type checker knows the branch below has a path.
+        yield NullMetricsSink()
+        return
     try:
-        pipeline = build_pipeline(
-            config,
-            adapters if adapters is not None else default_adapters(),
-            clock if clock is not None else SystemClock(),
-            bus,
-            sink,
-            timers=timers,
-        )
-    except ConfigError as failure:
-        _fail(str(failure), CONFIG_EXIT_CODE)
+        sink = CsvMetricsSink(choice.path, clock)
+    except OSError as failure:
+        _fail(f"metrics: cannot write to {choice.path} ({failure})", CONFIG_EXIT_CODE)
     try:
-        asyncio.run(pipeline.run(max_reports=max_reports, duration_seconds=duration))
-    except KeyboardInterrupt:  # pragma: no cover - requires a real signal
-        # An interrupt is how a session is meant to end, so it is not a traceback. `asyncio.run`
-        # has already cancelled the tasks, which is what closes the providers.
-        typer.echo("interrupted", err=True)
+        yield sink
+    finally:
+        sink.close()
 
 
 def _fail(message: str, code: int) -> NoReturn:

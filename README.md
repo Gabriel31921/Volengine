@@ -7,17 +7,19 @@ It ingests option chains (streaming or batch, crypto or equities), calibrates th
 using two competing engines—parametric (SVI) and neural (MLP)—and produces portfolio risk
 reports with explicit guarantees of freshness and arbitrage-free consistency.
 
-> **Status: Phase 1 complete, Phase 2 under way.** The whole architecture is built and the
-> pipeline runs end to end on trivial adapters; what phase 2 adds is the mathematics that is not
-> knowable from the design document — the real calibrator first. This is a working README; the
-> narrative one, including the context map, arrives in F3-G.
+> **Status: Phases 1 and 2 complete, Phase 3 four blocks in (F3-A to F3-D).** The pipeline runs
+> end to end on synthetic data and on the live Deribit BTC chain, with a SciPy SVI calibrator
+> wired in. A JAX SVI calibrator and a PyTorch MLP learner are built and tested behind the same
+> contract but not yet reachable from a configuration file; F3-E wires them in alongside the
+> comparative report. This is a working README; the narrative one, including the context map,
+> arrives in F3-G.
 
 ## The Four Contexts
 
 | Context              | Role                                                | Publishes           |
 | -------------------- | --------------------------------------------------- | ------------------- |
 | `market_data`        | Ingests and normalizes option chains                | `MarketSnapshot`    |
-| `parametric_pricing` | Calibrates SVI per expiry (SciPy, later JAX)        | `CalibratedSurface` |
+| `parametric_pricing` | Calibrates SVI per expiry (SciPy or JAX)            | `CalibratedSurface` |
 | `neural_surface`     | Learns the surface using a neural network (PyTorch) | `CalibratedSurface` |
 | `risk`               | Values portfolios and enforces the freshness policy | `RiskReport`        |
 
@@ -83,14 +85,49 @@ uv run volengine report --config examples/synthetic-svi.toml --count 2
 (spread, sizes, timestamp jitter, junk quotes keyed to the admissibility rules); `ScipyCalibrator`
 fits raw SVI back out of it with `least_squares`; and the report carries a volatility that can be
 checked against the parameters the file itself declares. `--duration <seconds>` bounds a `run`,
-and `writer = "csv"` with an `output_path` writes one row per valued position instead of printing.
-Neural Surface is implemented but deliberately not wired yet; see `docs/SEAMS.md`.
+`--metrics` logs every metric the contexts emit, and `writer = "csv"` with an `output_path` writes
+one row per valued position instead of printing.
+
+The third configuration opens a socket, to the live Deribit BTC options chain:
+
+```bash
+uv sync --extra deribit
+uv run volengine run --config examples/deribit-live.toml --duration 120 --metrics
+```
+
+`DeribitProvider` discovers the chain over REST, streams `ticker.*.100ms` over a websocket,
+reconnects with backoff, and rediscovers the universe periodically, because a Deribit expiry dies
+at 08:00 UTC every day. Inverse (BTC-settled) premiums are converted into the strike's currency
+before they cross the boundary, so the calibrator never learns which market they came from. No API
+key is needed. Every threshold in that file was measured against a real recording, and the
+measurement is written beside the value it defends. Thirty seconds of that recording, narrowed to
+two expiries, is committed as `tests/fixtures/deribit-btc-2026-09-18.jsonl`, and every test run
+replays it through the whole engine.
+
+### Built, not yet wired
+
+Two more producers are implemented and tested behind the same `CalibratedSurface` contract, but no
+TOML can select them yet:
+
+- **`svi-jax`** (`uv sync --extra jax`): the same SVI objective as the SciPy baseline, jitted, with
+  a warm Adam cycle and a cold multi-start L-BFGS one over a fixed padded shape (ADR-009, ADR-029).
+  The module also has forward-mode and reverse-mode greeks, which sit outside the contract.
+- **`mlp-torch`** (`uv sync --extra neural`): an MLP over log-forward-moneyness and tenor, trained
+  with soft Durrleman and calendar penalties and checked by a hard no-arbitrage gate before
+  publication. It fine-tunes warm from snapshot to snapshot, carrying its optimiser state across.
+
+A contract test harness runs every producer through the same assertions. Wiring both into the
+pipeline is F3-E's job; `docs/SEAMS.md` records why it waits. `market_data/adapters/heston.py` is
+also built, a Heston generator for synthetic chains with a real smile, and it is not reachable from
+a configuration either.
 
 ## Development
 
 ```bash
 uv sync --group dev          # development environment (without JAX or PyTorch)
 uv sync --extra jax          # adds the JAX calibrator (F3-A)
+uv sync --extra neural       # adds the PyTorch learner, CPU build (F3-D)
+uv sync --extra deribit      # adds the live Deribit feed (F3-C)
 
 uv run pytest                # tests
 uv run ruff check .          # lint
@@ -102,11 +139,13 @@ bash scripts/verify.sh       # all of the above, in the order CI runs them
 
 `scripts/verify.sh` is the single definition of "healthy": the developer, the review agents and
 `.github/workflows/ci.yml` all run that one script, so there is no second list to keep in step
-(ADR-024).
+(ADR-024). CI runs it three times: once bare, once with `--extra jax` and once with
+`--extra neural`. The Deribit tests need no extra, because the adapter imports its network
+libraries lazily.
 
 ## Documentation
 
-**`docs/adr/`** holds the architectural decision records — 26 of them, one decision per file,
+**`docs/adr/`** holds the architectural decision records — 29 of them, one decision per file,
 immutable. They are the answer to *why* the system is the way it is, and they are authoritative:
 where a record and a planning document disagree, the record wins. `docs/adr/README.md` is the
 index.
@@ -120,6 +159,6 @@ state). Docstrings throughout the code cite them — `Design §7.2`, `Implementa
 a type — so a citation that cannot be followed from a clone is pointing at one of those four. The
 ADRs are written so that the reasoning survives without them: where the code departs from a
 planning document, the departure is argued in the docstring that owns it *and* collected in an
-ADR (020, 021, 022, 023, 025). `CLAUDE.md`, the standing rules this repository is written to, is
+ADR (020, 021, 022, 023, 025, 027, 028, 029). `CLAUDE.md`, the standing rules this repository is written to, is
 outside Git for the same reason; its import rules are executable and live in `pyproject.toml`'s
 `[tool.importlinter]` contracts, which `tests/architecture/` runs.

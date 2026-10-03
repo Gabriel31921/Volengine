@@ -236,6 +236,75 @@ def test_a_degraded_chain_is_still_published() -> None:
     assert decide(stats=barely_usable) is True
 
 
+# --- the two halves of should_emit (F3-F)
+#
+# `BuildSnapshotUseCase` asks the cheap timing half on every tick and pays for `ChainStats` only
+# when it says yes. That is an optimisation only while `should_emit` stays the plain conjunction of
+# the halves; the first test below is what fails the day a third condition grows inside one of them.
+
+
+@pytest.mark.parametrize("coverage", [0.0, 0.5])
+@pytest.mark.parametrize("move", [0.0, 0.001, 0.002, 0.5, float("nan")])
+@pytest.mark.parametrize("elapsed", [None, -5.0, 0.5, 1.0, 2.0, 30.0, 300.0])
+@pytest.mark.parametrize("max_quiet", [None, 30.0])
+def test_should_emit_is_coverage_and_the_timing_half(
+    coverage: float, move: float, elapsed: float | None, max_quiet: float | None
+) -> None:
+    policy = SnapshotPolicy(replace(make_config(), max_quiet_seconds=max_quiet))
+    last_emit = None if elapsed is None else NOW - timedelta(seconds=elapsed)
+    stats = make_stats(coverage_ratio=coverage)
+
+    assert policy.should_emit(stats, move, last_emit, NOW) is (
+        coverage > 0 and policy.is_due(move, last_emit, NOW)
+    )
+
+
+def test_the_conjunction_test_sees_both_answers() -> None:
+    """The guard on the test above: over its grid the timing half answers both ways, so the
+    equivalence is not satisfied by a half that is constantly ``False``."""
+    policy = SnapshotPolicy(make_config())
+
+    assert policy.is_due(0.5, NOW - timedelta(seconds=2), NOW) is True
+    assert policy.is_due(0.0, NOW - timedelta(seconds=2), NOW) is False
+
+
+def test_the_cadence_has_elapsed_for_a_first_emission() -> None:
+    assert SnapshotPolicy(make_config()).cadence_elapsed(None, NOW) is True
+
+
+def test_the_cadence_has_not_elapsed_inside_the_window() -> None:
+    policy = SnapshotPolicy(make_config())
+
+    assert policy.cadence_elapsed(NOW - timedelta(seconds=0.5), NOW) is False
+
+
+def test_the_cadence_has_elapsed_exactly_at_its_boundary() -> None:
+    policy = SnapshotPolicy(make_config())
+
+    assert policy.cadence_elapsed(NOW - timedelta(seconds=1.0), NOW) is True
+
+
+def test_a_clock_running_backwards_has_not_elapsed_the_cadence() -> None:
+    policy = SnapshotPolicy(make_config())
+
+    assert policy.cadence_elapsed(NOW + timedelta(seconds=90), NOW) is False
+
+
+def test_the_cadence_question_rejects_a_naive_instant() -> None:
+    policy = SnapshotPolicy(make_config())
+
+    with pytest.raises(ValueError, match="now"):
+        policy.cadence_elapsed(None, NAIVE)
+    with pytest.raises(ValueError, match="last_emit"):
+        policy.cadence_elapsed(NAIVE, NOW)
+
+
+def test_an_empty_chain_still_has_its_instants_validated() -> None:
+    """Coverage refuses first; a naive ``last_emit`` must not slip past behind it."""
+    with pytest.raises(ValueError, match="last_emit"):
+        decide(stats=make_stats(coverage_ratio=0.0), last_emit=NAIVE)
+
+
 # --- assess_quality
 
 

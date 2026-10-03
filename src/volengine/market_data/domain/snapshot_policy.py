@@ -172,6 +172,14 @@ class SnapshotPolicy:
     ) -> bool:
         """Decide whether the chain as it stands is worth publishing.
 
+        The conjunction of two halves that cost very different amounts to evaluate, and that is
+        why they also exist on their own. :meth:`is_due` is the *timing* half -- cadence,
+        heartbeat, movement -- and needs nothing but two instants and one number; the coverage
+        test needs ``ChainStats``, which costs as much as building the snapshot itself. A caller
+        that evaluates the policy on every tick asks the cheap half first and pays for the stats
+        only when the answer could be yes (``BuildSnapshotUseCase.build``). Because this method is
+        the plain ``and`` of the two, that ordering is an optimisation and never a second rule.
+
         Args:
             stats: Coverage and freshness of the chain at ``now``.
             max_relative_move: Largest relative mid move since the last emission, as a
@@ -187,31 +195,57 @@ class SnapshotPolicy:
                 other, and mixing naive with aware raises ``TypeError`` from inside the
                 arithmetic, far from whoever produced the bad value.
         """
-        require_aware(now, "now")
-        if last_emit is not None:
-            require_aware(last_emit, "last_emit")
-
         # `<= 0` rather than `not stats.coverage_ratio`: `not 0.0` is True, so the truthiness
         # version appears to work while being right for the wrong reason, and would reject a
         # legitimate zero anywhere else in this file.
         if stats.coverage_ratio <= 0:
+            # Still validated: an empty chain must not let a naive instant through unnoticed.
+            self.cadence_elapsed(last_emit, now)
             return False
+        return self.is_due(max_relative_move, last_emit, now)
 
+    def cadence_elapsed(self, last_emit: datetime | None, now: datetime) -> bool:
+        """Whether enough time has passed since the last emission for another one to be allowed.
+
+        The cheapest question the policy can answer -- one subtraction -- and the one that says no
+        most often: a chain ticking hundreds of times a second against a one-second cadence is
+        refused here on all but a handful of ticks. Necessary for :meth:`is_due` and never
+        sufficient, so a ``False`` here is a final answer and a ``True`` is not.
+
+        A first emission (``last_emit is None``) is always allowed. A clock running backwards --
+        a ``ManualClock`` rewound in a replay -- yields a negative elapsed time, which is below
+        any positive cadence, so it is not: time has not passed.
+
+        Raises:
+            ValueError: If ``now`` or ``last_emit`` is naive.
+        """
+        require_aware(now, "now")
         # `is None`, never `not last_emit`: datetime defines no __bool__ and is always truthy,
         # so the truthy form would silently never fire.
         if last_emit is None:
             return True
+        require_aware(last_emit, "last_emit")
+        return (now - last_emit).total_seconds() >= self.config.cadence_seconds
 
-        # A backwards clock -- a ManualClock rewound in a replay -- yields a negative elapsed,
-        # which is below any positive cadence and therefore does not emit. That is the intended
-        # reading: time has not passed.
-        elapsed = (now - last_emit).total_seconds()
-        if elapsed < self.config.cadence_seconds:
+    def is_due(self, max_relative_move: float, last_emit: datetime | None, now: datetime) -> bool:
+        """The timing half of :meth:`should_emit`: cadence, then heartbeat, then movement.
+
+        Everything the decision needs except the chain's coverage, so it can be asked before
+        ``ChainStats`` is computed. ``max_relative_move`` is linear in the number of quotes held
+        but touches no admissibility rule, which is what makes it cheap enough to ask on a tick.
+
+        Raises:
+            ValueError: If ``now`` or ``last_emit`` is naive.
+        """
+        if not self.cadence_elapsed(last_emit, now):
             return False
+        if last_emit is None:
+            return True
 
         # The heartbeat outranks the movement test, and only that one: it is the escape hatch
         # for a market so calm that the AND would keep us silent forever. It never overrides
         # the cadence, which is why the config forbids it from being shorter.
+        elapsed = (now - last_emit).total_seconds()
         max_quiet = self.config.max_quiet_seconds
         if max_quiet is not None and elapsed >= max_quiet:
             return True

@@ -13,7 +13,10 @@ the engine be ignorant of the wiring.
 * It owns **publication**. Every handler is a synchronous function returning
   ``tuple[Event, ...]``; the closures below call them and publish the result (ADR-016).
 * It owns **the threads**. ADR-005's per-producer pool is applied here, so a calibration can be
-  pushed off the event loop without the use case ever learning that threads exist.
+  pushed off the event loop without the use case ever learning that threads exist. The pool is
+  keyed by *producer*, not by market: two markets fitted by ``svi-scipy`` queue on one worker,
+  while ``svi-scipy`` and another producer run side by side. That is ADR-005 read literally -- one
+  pool per calibrator -- and it is what keeps a producer's latency attributable to the producer.
 * It owns **the heartbeat**, and that closes the seam ``IngestStreamUseCase`` left open.
   ``max_quiet_seconds`` was written so that a calm market is still heard from, but the ingestion
   loop only evaluates the snapshot policy when an update *arrives* -- so a feed that stops
@@ -65,10 +68,17 @@ the same topic, which is the arrangement Design 6.5 and 7.3 exist to compare.
 **Everything except the calibrations runs on the event loop**, single-threaded, and that is a
 choice rather than an oversight. ``QuoteChain``, ``CalibrationState`` and
 ``LastValueSurfaceProvider`` are all documented as not thread-safe; the calibrations are the only
-work long enough to be worth an executor, they are one per producer, and the pool has one worker,
-so each producer's state is still touched by one thread at a time. The results are published back
-on the loop -- never from the worker -- because ``InProcessConflatingBus`` drives an
-``asyncio.Event`` and is not thread-safe either.
+work long enough to be worth an executor, each market gets its own ``CalibrateOnSnapshot`` and
+``CalibrationState`` per producer, and the pool has one worker, so each of those states is touched
+by one thread at a time. The results are published back on the loop -- never from the worker --
+because ``InProcessConflatingBus`` drives an ``asyncio.Event`` and is not thread-safe either.
+
+**Several markets are several loops, and nothing downstream is told** (Design 4.7). Each configured
+market gets its own ``QuoteChain``, snapshot policy, ingestion task, heartbeat and rediscovery
+timer, and its own calibration state and report per producer; what they share is the bus, the
+clock, the metrics sink, the thread pools and the surface cache -- which keys by market already.
+Routing by ``market_id`` is the whole of the multi-market support, and F3-F added a second market
+(``examples/multi-market.toml``) without a line changing in Parametric Pricing or Risk.
 """
 
 from __future__ import annotations
@@ -76,7 +86,6 @@ from __future__ import annotations
 import asyncio
 import math
 from collections.abc import Callable, Mapping, Sequence
-from concurrent.futures import Executor
 from dataclasses import dataclass, replace
 from importlib.util import find_spec
 from pathlib import Path
@@ -433,7 +442,6 @@ class _Producer:
     report: ComputeReportUseCase
     snapshots: Subscription
     surfaces: Subscription
-    executor: Executor
 
 
 @dataclass(frozen=True, slots=True)
@@ -450,6 +458,8 @@ def build_pipeline(
     clock: Clock,
     bus: EventBus,
     metrics: MetricsSink,
+    *,
+    timers: bool = True,
 ) -> Pipeline:
     """Build every context instance, wire the subscriptions, and hand back something runnable.
 
@@ -465,6 +475,17 @@ def build_pipeline(
         bus: Where events go. Subscriptions are opened during this call, before anything can
             publish, so no consumer can miss the first snapshot of a session.
         metrics: One sink for every context, for the same reason as the clock.
+        timers: Whether the per-market timers run -- the heartbeat and the rediscovery poll.
+            ``False`` is for a replay (``volengine replay``), the one run where a timer has no
+            meaning: under a ``SimulatedClock`` only the recording moves time, so a timer either
+            never reaches its deadline or spins, and whether it fired at all would depend on how
+            the loop interleaved two tasks. **The snapshot policy is untouched by it.**
+            ``max_quiet_seconds`` stays in force and is still asked on every recorded tick, at
+            that tick's recorded instant, so a replay keeps the heartbeat's rule and loses only
+            the occasions a live timer adds during a gap with no tick at all. That split is what
+            closed F3-C's live-replay stall: dropping ``max_quiet_seconds`` from the policy, as
+            the replay did before F3-F, left a session whose first snapshot rested on one quote
+            unable to publish a second.
 
     Returns:
         A :class:`Pipeline` whose subscriptions are already live.
@@ -509,10 +530,10 @@ def build_pipeline(
                 build=build,
                 heartbeat_seconds=(
                     market.snapshot.cadence_seconds
-                    if market.snapshot.max_quiet_seconds is not None
+                    if timers and market.snapshot.max_quiet_seconds is not None
                     else None
                 ),
-                rediscovery_seconds=market.rediscovery_seconds,
+                rediscovery_seconds=market.rediscovery_seconds if timers else None,
             )
         )
 
@@ -548,7 +569,6 @@ def build_pipeline(
                         surface_topic(market.market_id, producer_id),
                         f"risk-{producer_id}@{market.market_id}",
                     ),
-                    executor=executors.for_producer(producer_id),
                 )
             )
 
@@ -964,6 +984,13 @@ class Pipeline:
         Events other than ``SnapshotReady`` are ignored rather than refused: a topic is a
         contract about *where*, not about *what*, and a handler that raised on an unexpected event
         would trade a harmless no-op for a counted failure.
+
+        **The pool is looked up on every call rather than held**, and that is what makes
+        :meth:`run` re-entrant. ``run`` shuts every pool down on its way out, as it must -- a
+        thread left alive outlives the session that owned it -- and ``NamedExecutors`` forgets
+        them when it does, so the next lookup builds a fresh one. A pool captured at wiring time
+        would instead be the dead one, and a second ``run()`` would raise on its first submit
+        (a debt F1-07 left, closed in F3-F).
         """
 
         async def handle(event: Event) -> None:
@@ -971,7 +998,9 @@ class Pipeline:
                 return
             loop = asyncio.get_running_loop()
             produced = await loop.run_in_executor(
-                producer.executor, producer.calibrate.handle, event.snapshot
+                self._executors.for_producer(producer.producer_id),
+                producer.calibrate.handle,
+                event.snapshot,
             )
             for outcome in produced:
                 self._publish(outcome)

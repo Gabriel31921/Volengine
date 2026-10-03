@@ -183,11 +183,12 @@ def replay(
     quote rather than one that ticks on its own. Two replays of one recording write the same
     report, byte for byte.
 
-    **What that does not remove is conflation** (ADR-003). A replay hands its quotes over as fast
-    as the consumer takes them, so a snapshot published while the previous fit is still on its pool
-    is overwritten in a one-slot mailbox -- and *how many* reports a long recording produces is
-    therefore still a function of how fast this machine fits. That is the engine behaving as it
-    does live, reproduced rather than removed; ``docs/SEAMS.md`` says where it bites.
+    **What that does not reproduce is the live interleaving** (ADR-003). ``RecordedProvider``
+    awaits nothing between quotes, so the ingestion task holds the event loop until the file ends:
+    every snapshot is published, each overwrites the last in the calibrators' one-slot mailboxes,
+    and the fit sees only the final one. Measured on the golden fixture in F3-F: 25 snapshots, one
+    surface, one report. That makes a replay's *report* deterministic for a reason that is not the
+    one this docstring used to give, and it is in ``docs/SEAMS.md`` with the choice it leaves.
 
     Which market runs is the recording's decision, not the flag's: the file names the market it
     holds and the configuration is narrowed to it. A ``--market`` option here could only agree or
@@ -197,11 +198,19 @@ def replay(
     **No ``--duration``.** A recording is finite and ends when it ends; a time limit would be
     counted on the recorded clock, where "ten seconds" is a property of the file rather than of
     the person waiting. ``--count`` stops early on a number the engine controls.
+
+    **No timers, and the heartbeat's rule kept.** The heartbeat task and the rediscovery poll are
+    not started: under a ``SimulatedClock`` only the recording moves time, so either would fire on
+    the loop's schedule rather than the session's. ``max_quiet_seconds`` itself stays in the
+    policy, which asks it on every recorded tick at that tick's recorded instant -- so a quiet
+    market is still heard from every ``max_quiet_seconds``, deterministically. Until F3-F the
+    replay dropped the setting outright, and a recording whose first snapshot rested on one quote
+    replayed as that snapshot and nothing after it.
     """
     if count is not None and count <= 0:
         _fail(f"--count must be positive, got {count}", CONFIG_EXIT_CODE)
     session = _open(recording)
-    selected = _without_heartbeat(_configure(config, session.market_id, calibrators))
+    selected = _configure(config, session.market_id, calibrators)
     _require_same_underlying(selected, session)
     clock = SimulatedClock(session.started_at)
     _drive(
@@ -210,6 +219,7 @@ def replay(
         max_reports=count,
         adapters=with_replay(default_adapters(), session, clock),
         clock=clock,
+        timers=False,
     )
 
 
@@ -308,33 +318,6 @@ def _require_same_underlying(config: AppConfig, recording: Recording) -> None:
         )
 
 
-def _without_heartbeat(config: AppConfig) -> AppConfig:
-    """Drop ``max_quiet_seconds`` for a replay, which is the one run where it cannot mean anything.
-
-    The heartbeat is a timer racing the stream so that a *stopped feed* is heard about rather than
-    mistaken for a calm market (``Pipeline._heartbeat``). Under a replay there is no such thing as
-    a stopped feed: time only moves when the recording moves it, so a timer either never fires --
-    the clock never reaches its deadline on its own -- or spins the loop asking the same question
-    of a chain nothing has changed. Worse, whether it fires at all would depend on how the event
-    loop interleaved two tasks, which is precisely the non-determinism this command exists to
-    remove.
-
-    Left as a transformation of the configuration rather than a flag on ``Pipeline``: the graph is
-    built from the file, and the honest way to say "this run has no heartbeat" is a file that does
-    not configure one. ``docs/SEAMS.md`` records what stays open -- a recorded session's *quiet*
-    periods replay as quiet, and nothing in a replay reproduces the snapshots the heartbeat emitted
-    during the original run.
-    """
-    return AppConfig(
-        markets=tuple(
-            replace(market, snapshot=replace(market.snapshot, max_quiet_seconds=None))
-            for market in config.markets
-        ),
-        calibration=config.calibration,
-        risk=config.risk,
-    )
-
-
 def _drive(
     config: AppConfig,
     metrics: bool,
@@ -342,8 +325,12 @@ def _drive(
     duration: float | None = None,
     adapters: Adapters | None = None,
     clock: Clock | None = None,
+    timers: bool = True,
 ) -> None:
     """Build the pipeline and run it, translating a wiring failure into an exit code.
+
+    ``timers=False`` is the replay's: no heartbeat task and no rediscovery poll, with the snapshot
+    policy left exactly as the file states it (``pipeline.build_pipeline`` says why).
 
     The one place in the engine that configures ``logging``, and it does so only for ``--metrics``.
     ``LoggingMetricsSink`` emits at INFO and an unconfigured root logger drops everything below
@@ -363,6 +350,7 @@ def _drive(
             clock if clock is not None else SystemClock(),
             bus,
             sink,
+            timers=timers,
         )
     except ConfigError as failure:
         _fail(str(failure), CONFIG_EXIT_CODE)

@@ -19,6 +19,7 @@ event history, because a conflating mailbox shows a subscriber only what it kept
 from __future__ import annotations
 
 import asyncio
+import threading
 from collections.abc import AsyncIterator, Mapping, Sequence
 from datetime import datetime, time, timedelta
 from pathlib import Path
@@ -54,6 +55,7 @@ from volengine.parametric_pricing.domain.errors import CalibrationError
 from volengine.parametric_pricing.domain.ports import Calibrator
 from volengine.parametric_pricing.domain.svi_slice import SVIParams
 from volengine.platform.bus import InProcessConflatingBus, Subscription
+from volengine.platform.clock import SimulatedClock
 from volengine.platform.metrics import MetricsSink
 from volengine.risk.application.compute_report import ReportSettings
 from volengine.risk.domain.freshness_policy import FreshnessPolicy
@@ -264,6 +266,41 @@ class FlakyCalibrator(StubCalibrator):
         return super().calibrate(previous, task)
 
 
+class ThreadNotingCalibrator(StubCalibrator):
+    """A ``StubCalibrator`` that notes which thread fitted it and can wait for a partner first.
+
+    The fake behind ADR-005's tests. ``threads`` says *where* each fit ran, which is how a test
+    sees a pool keyed by producer rather than by market. ``barrier`` says *when*: a fit that waits
+    on a two-party barrier only returns if another fit is running at the same moment on another
+    thread, so two of these sharing a barrier finish only when their producers really run side by
+    side -- on one shared single-worker pool the first would wait out the timeout alone and raise.
+
+    ``threading.Barrier`` and a real timeout, because this runs on the executor thread like a real
+    fit; the timeout is what turns a regression into a failure instead of a hang.
+    """
+
+    def __init__(
+        self,
+        producer_id: str = CALIBRATOR_NAME,
+        barrier: threading.Barrier | None = None,
+        timeout_seconds: float = 5.0,
+    ) -> None:
+        super().__init__(producer_id=producer_id)
+        self._barrier = barrier
+        self._timeout_seconds = timeout_seconds
+        self.threads: list[str] = []
+
+    def calibrate(
+        self,
+        previous: Mapping[datetime, SVIParams] | None,
+        task: CalibrationTask,
+    ) -> CalibrationResult:
+        self.threads.append(threading.current_thread().name)
+        if self._barrier is not None:
+            self._barrier.wait(timeout=self._timeout_seconds)
+        return super().calibrate(previous, task)
+
+
 class RecordingCalibrator:
     """A ``Calibrator`` that keeps what a real one was asked and what it answered.
 
@@ -292,6 +329,34 @@ class RecordingCalibrator:
         self.tasks.append(task)
         self.results.append(result)
         return result
+
+
+class RefusingAfter:
+    """A real ``Calibrator`` that fits a few cycles and then refuses every one after them.
+
+    ``FlakyCalibrator``'s shape over a *real* fit rather than a stub, for the degraded paths that
+    have to be walked on real data: what ADR-006 republishes is the surface an actual optimiser
+    produced from an actual chain, and only a wrapper around one can hand it back.
+    """
+
+    def __init__(self, inner: Calibrator, good_cycles: int) -> None:
+        self._inner = inner
+        self._good_cycles = good_cycles
+        self.calls = 0
+
+    @property
+    def producer_id(self) -> str:
+        return self._inner.producer_id
+
+    def calibrate(
+        self,
+        previous: Mapping[datetime, SVIParams] | None,
+        task: CalibrationTask,
+    ) -> CalibrationResult:
+        self.calls += 1
+        if self.calls > self._good_cycles:
+            raise CalibrationError("the optimiser did not converge on this snapshot")
+        return self._inner.calibrate(previous, task)
 
 
 class RecordingBus:
@@ -363,6 +428,36 @@ class BlockingProvider:
 
     async def close(self) -> None:
         self.closed = True
+
+
+class ClockSettingProvider:
+    """A provider wrapped so that its own stamps move a ``SimulatedClock`` forward, never back.
+
+    What a second market needs under a replay. ``RecordedProvider`` moves the engine's clock to
+    each recorded instant; a synthetic feed beside it has a timeline of its own and moves nothing,
+    so on a clock only the recording drives its snapshot cadence never elapses and it publishes the
+    one snapshot its first quote earns. Moving the clock to ``max(now, ts_local)`` lets each feed
+    advance time without ever rewinding the other's -- a merged timeline of two sources, which is
+    what a multi-market replay would have to be and the engine does not build (``docs/SEAMS.md``).
+    """
+
+    def __init__(self, inner: MarketDataProvider, clock: SimulatedClock) -> None:
+        self._inner = inner
+        self._clock = clock
+
+    async def discover(self) -> tuple[InstrumentId, ...]:
+        return await self._inner.discover()
+
+    def stream(self) -> AsyncIterator[QuoteUpdate]:
+        return self._stream()
+
+    async def _stream(self) -> AsyncIterator[QuoteUpdate]:
+        async for update in self._inner.stream():
+            self._clock.set(max(self._clock.now(), update.observation.ts_local))
+            yield update
+
+    async def close(self) -> None:
+        await self._inner.close()
 
 
 def two_sided(strike: float = FORWARD) -> list[QuoteUpdate]:

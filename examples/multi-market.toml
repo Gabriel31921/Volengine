@@ -1,0 +1,187 @@
+# Two markets on one bus -- Design 4.7, and F3-F's proof of the design:
+#
+#     uv sync --extra deribit
+#     uv run volengine run --config examples/multi-market.toml --duration 120 --metrics
+#     uv run volengine run --config examples/multi-market.toml --market BTC-SYNTH --duration 30
+#
+# `BTC-DERIBIT` is the live venue and `BTC-SYNTH` an invented chain, each its own Market Data
+# context instance with its own conventions, chain, snapshot policy and timers. Both publish onto
+# the same bus, tagged by `market_id`, and everything downstream is the code that ran one market
+# before this file existed: the same calibrators, the same Risk. What is per market -- the chain,
+# the calibration state, the published grid, the share of the book -- is per market because the
+# composition root builds one of each per `[[market]]` table, not because anything downstream
+# learned there were two. F3-F added this file without a line changing in Parametric Pricing or
+# Risk; `tests/entrypoints/test_multi_market.py` runs it with the venue replaced by the golden
+# fixture.
+#
+# Each market's tables are copies of the file that runs it alone -- `deribit-live.toml` and
+# `synthetic-svi.toml` -- and the measurements behind every value are written there rather than
+# repeated here. What differs is said where it differs.
+#
+# What a file cannot do yet, and why it shows here: `[calibration]` and `[risk]` are one table for
+# the whole engine (`docs/SEAMS.md`). Both markets are therefore fitted with the same tuning and
+# the same acceptance, and that tuning is the venue's -- its seven-day slice needs the wider Huber
+# scale and the larger budget, and the synthetic chain converges under either.
+
+[[market]]
+id = "BTC-DERIBIT"
+underlying = "BTC"
+provider = "deribit"
+max_skew_seconds = 60.0
+rediscovery_seconds = 300.0
+
+[market.conventions]
+day_count = "ACT/365F"
+expiry_time_utc = 08:00:00
+numeraire = "INVERSE"
+forward_method = "PROVIDER_UNDERLYING"
+
+[market.admissibility]
+max_spread_rel = 0.5
+max_age_seconds = 30.0
+moneyness_range = [-1.0, 1.0]
+max_iv_divergence_bp = 500.0
+convexity_tolerance = 0.0005
+min_size = 1.0
+
+[market.snapshot]
+cadence_seconds = 1.0
+material_move_threshold = 0.002
+min_coverage_ratio = 0.5
+max_quiet_seconds = 5.0
+
+[market.deribit]
+ws_url = "wss://www.deribit.com/ws/api/v2"
+rest_url = "https://www.deribit.com/api/v2"
+heartbeat_seconds = 30.0
+silence_timeout_seconds = 75.0
+reconnect_initial_seconds = 1.0
+reconnect_max_seconds = 60.0
+request_timeout_seconds = 10.0
+subscribe_batch_size = 250
+
+[[market]]
+id = "BTC-SYNTH"
+# The same underlying on purpose. The book is split by underlying (`pipeline._book_for`), so the
+# one BTC position below is valued twice -- once off each market's surface -- and the two reports
+# differ only by what each market quoted, which is the comparison Design 10.6 asks for.
+underlying = "BTC"
+provider = "synthetic"
+max_skew_seconds = 30.0
+
+[market.conventions]
+day_count = "ACT/365F"
+expiry_time_utc = 08:00:00
+numeraire = "INVERSE"
+forward_method = "PROVIDER_UNDERLYING"
+
+[market.admissibility]
+max_spread_rel = 0.5
+max_age_seconds = 5.0
+moneyness_range = [-1.5, 1.5]
+max_iv_divergence_bp = 500.0
+convexity_tolerance = 0.0005
+min_size = 1.0
+
+[market.snapshot]
+cadence_seconds = 1.0
+material_move_threshold = 0.002
+min_coverage_ratio = 0.8
+max_quiet_seconds = 5.0
+
+[market.synthetic]
+# Near the venue's own level on the day the golden fixture was recorded (a 78-79k forward), so the
+# one strike in the book sits at a comparable moneyness on both markets.
+forward0 = 78000.0
+strikes_per_expiry = 11
+log_moneyness_range = [-0.25, 0.25]
+spread_bp = 200.0
+vol_noise_bp = 50.0
+size = 10.0
+junk_quote_rate = 0.02
+forward_move_rel = 0.002
+latency_seconds = 0.008
+jitter_seconds = 0.05
+# An hour of one cycle a second: long enough for any `--duration` this file is run with. When the
+# cycles run out this market's feed ends and its surface ages under the freshness policy while the
+# venue's goes on, which is the per-market degradation Design 7.2 describes rather than a crash.
+cycles = 3600
+interval_seconds = 1.0
+seed = 20260918
+
+[[market.synthetic.slice]]
+expiry_days = 7.0
+a = 0.004
+b = 0.030
+rho = -0.20
+m = 0.0
+sigma = 0.15
+
+[[market.synthetic.slice]]
+expiry_days = 90.0
+a = 0.055
+b = 0.090
+rho = -0.25
+m = 0.0
+sigma = 0.25
+
+[[market.synthetic.slice]]
+expiry_days = 365.0
+a = 0.190
+b = 0.180
+rho = -0.15
+m = 0.0
+sigma = 0.35
+
+[calibration]
+# One producer per market. A second one here is compared with the first on each market separately
+# (F3-E), but the only other producer a file can name today is `flat-vol`, and a flat line does
+# not fit the venue's smile inside the acceptance below -- measured on the golden fixture, it is
+# refused on every cycle, so it would add a `CalibrationFailed` per snapshot and no comparison.
+calibrators = ["svi-scipy"]
+
+[calibration.grid]
+k_min = -0.6
+k_max = 0.6
+n_nodes = 25
+
+[calibration.weighting]
+spread_scale = 0.05
+flagged_factor = 0.25
+unpaired_itm_factor = 0.1
+
+[calibration.acceptance]
+max_rmse_vol_bp = 200.0
+
+[calibration.fit]
+huber_scale_bp = 300.0
+durrleman_penalty_bp = 10000.0
+durrleman_mesh_nodes = 51
+durrleman_mesh_margin = 0.5
+min_quotes_for_free_shape = 5
+ridge_bp = 5.0
+max_nfev = 1000
+
+[risk]
+writer = "console"
+
+[risk.freshness]
+warn_seconds = 30.0
+reject_seconds = 120.0
+
+[risk.report]
+discount = 1.0
+
+[risk.report.bumps]
+forward_rel = 0.01
+vol_abs = 0.01
+
+[[risk.position]]
+underlying = "BTC"
+# A quarterly the venue lists (`BTC-25DEC26-…`), inside both markets' tenor axes; the synthetic
+# market's 365-day slice reaches past it whenever the file is run. TOML has no relative date, so
+# this has to be bumped once it passes -- see the note in `synthetic-svi.toml`.
+expiry = 2026-12-25T08:00:00Z
+strike = 80000.0
+kind = "CALL"
+quantity = 1.0

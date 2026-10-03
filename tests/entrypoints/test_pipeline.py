@@ -13,7 +13,9 @@ rule is a report count, so every test below runs in milliseconds and always in t
 from __future__ import annotations
 
 import asyncio
+import threading
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from datetime import timedelta
 from importlib.util import find_spec
@@ -28,6 +30,7 @@ from tests.entrypoints.builders import (
     RecordingBus,
     RecordingWriter,
     SlowCalibrator,
+    ThreadNotingCalibrator,
     make_adapters,
     make_app_config,
     make_calibration_config,
@@ -46,7 +49,11 @@ from tests.market_data.builders import (
     make_deribit_settings,
     make_instrument,
 )
-from tests.parametric_pricing.builders import StubCalibrator, make_market_snapshot
+from tests.parametric_pricing.builders import (
+    StubCalibrator,
+    make_calibration_task,
+    make_market_snapshot,
+)
 from tests.risk.builders import make_calibrated_surface
 from tests.support import RecordingMetrics
 from volengine.contracts.events import (
@@ -60,6 +67,7 @@ from volengine.entrypoints.config import (
     SYNTHETIC_PROVIDER,
     AppConfig,
     ConfigError,
+    MarketConfig,
 )
 from volengine.entrypoints.pipeline import (
     Adapters,
@@ -76,6 +84,7 @@ from volengine.market_data.adapters.deribit_ws import DeribitProvider, DeribitSe
 from volengine.market_data.adapters.synthetic import SyntheticConfig, SyntheticProvider
 from volengine.market_data.domain.errors import MarketDataError
 from volengine.market_data.domain.option_quote import InstrumentId, OptionKindD
+from volengine.market_data.domain.ports import MarketDataProvider
 from volengine.parametric_pricing.adapters.scipy_calibrator import FitSettings, ScipyCalibrator
 from volengine.parametric_pricing.domain.errors import CalibrationError
 from volengine.platform.bus import InProcessConflatingBus
@@ -750,3 +759,262 @@ async def test_a_market_without_a_rediscovery_cadence_discovers_once() -> None:
     await asyncio.wait_for(pipeline.run(), timeout=5.0)
 
     assert provider.discoveries == 1
+
+
+# --- the thread pools of ADR-005, and running twice (F3-F)
+
+
+def two_market_pipeline(
+    calibrators: dict[str, StubCalibrator],
+    metrics: RecordingMetrics | None = None,
+) -> tuple[RecordingWriter, RecordingBus, Pipeline]:
+    """Two markets on one underlying, each fed by its own provider, one bus between them.
+
+    ``BTC-DERIBIT`` and ``BTC-SYNTH`` are the pair Design 4.7 and F3-F name. Both quote BTC, so the
+    book splits into the same position for each, and everything that tells their outputs apart has
+    to come from routing by ``market_id`` -- which is the claim under test.
+    """
+    sink = metrics if metrics is not None else RecordingMetrics()
+    writer = RecordingWriter()
+    bus = RecordingBus(sink)
+    config = make_app_config(
+        markets=(
+            make_market_config(market_id="BTC-DERIBIT", provider="first"),
+            make_market_config(market_id="BTC-SYNTH", provider="second"),
+        ),
+        calibration=make_calibration_config(calibrators=tuple(calibrators)),
+    )
+    adapters = make_adapters(
+        StubProvider(updates=()), dict(calibrators), writer, provider_name="unused"
+    )
+    feeds = {
+        name: StubProvider(updates=two_sided(), instruments=one_instrument())
+        for name in ("first", "second")
+    }
+    pipeline = build_pipeline(
+        config,
+        Adapters(
+            providers={name: _serving(feed) for name, feed in feeds.items()},
+            calibrators=adapters.calibrators,
+            writers=adapters.writers,
+        ),
+        ManualClock(NOW),
+        bus,
+        sink,
+    )
+    return writer, bus, pipeline
+
+
+def _serving(feed: StubProvider) -> Callable[[MarketConfig], MarketDataProvider]:
+    """A factory over one feed the test already holds, bound per name rather than per loop."""
+
+    def build(_config: MarketConfig) -> MarketDataProvider:
+        return feed
+
+    return build
+
+
+async def test_two_producers_fit_at_the_same_time_on_their_own_pools() -> None:
+    """ADR-005 as behaviour: each fit waits for the other, so both finish only side by side."""
+    barrier = threading.Barrier(2)
+    first = ThreadNotingCalibrator(producer_id="svi-a", barrier=barrier)
+    second = ThreadNotingCalibrator(producer_id="svi-b", barrier=barrier)
+    writer, _, pipeline = make_pipeline(
+        StubProvider(updates=two_sided(), instruments=one_instrument()),
+        calibrators={"svi-a": first, "svi-b": second},
+    )
+
+    await asyncio.wait_for(pipeline.run(), timeout=10.0)
+
+    assert {report.producer_id for report in writer.reports} == {"svi-a", "svi-b"}
+    assert first.threads[0].startswith("volengine-svi-a")
+    assert second.threads[0].startswith("volengine-svi-b")
+
+
+def test_the_barrier_cannot_be_passed_on_one_shared_worker() -> None:
+    """The guard on the test above: the fake really does fail where the pools are not separate.
+
+    Two fits submitted to *one* single-worker pool, which is the arrangement ADR-005 rejects: the
+    first waits alone for its partner, which is queued behind it, and the barrier breaks.
+    """
+    barrier = threading.Barrier(2)
+    fits = [
+        ThreadNotingCalibrator(producer_id=name, barrier=barrier, timeout_seconds=0.2)
+        for name in ("svi-a", "svi-b")
+    ]
+    task = make_calibration_task()
+    with ThreadPoolExecutor(max_workers=1) as shared:
+        outcomes = [shared.submit(fit.calibrate, None, task) for fit in fits]
+        failures = [outcome.exception() for outcome in outcomes]
+
+    assert all(isinstance(failure, threading.BrokenBarrierError) for failure in failures)
+
+
+async def test_one_producer_on_two_markets_fits_both_on_its_one_pool() -> None:
+    """The pool is keyed by producer, not by market: ADR-005's "one pool per calibrator".
+
+    One worker, so the two markets' fits of one producer queue behind each other and its latency
+    stays its own. Each market still has its own ``CalibrateOnSnapshot`` and ``CalibrationState``;
+    what they share is the thread, never the state.
+    """
+    shared = ThreadNotingCalibrator(producer_id=CALIBRATOR_NAME)
+    _, _, pipeline = two_market_pipeline({CALIBRATOR_NAME: shared})
+
+    await asyncio.wait_for(pipeline.run(), timeout=5.0)
+
+    assert len(shared.threads) == 2
+    assert len(set(shared.threads)) == 1
+    assert shared.threads[0].startswith(f"volengine-{CALIBRATOR_NAME}")
+
+
+async def test_a_pipeline_runs_again_after_its_pools_were_shut_down() -> None:
+    """``run`` closes every pool on its way out; a second ``run`` must build fresh ones.
+
+    A pool captured at wiring time would be the dead one, and the second run's first fit would
+    raise on submit -- swallowed and counted by the runner, so the only symptom would be a run
+    that writes nothing. The clock is moved between the runs so that the cadence lets the second
+    session's snapshot out at all; without that, the market would be silent for a reason of its own.
+    """
+    clock = ManualClock(NOW)
+    writer, _, pipeline = make_pipeline(
+        StubProvider(updates=two_sided(), instruments=one_instrument()),
+        calibrators={CALIBRATOR_NAME: SlowCalibrator()},
+        clock=clock,
+    )
+    await asyncio.wait_for(pipeline.run(), timeout=5.0)
+    first_run = len(writer.reports)
+    clock.advance(10.0)
+
+    await asyncio.wait_for(pipeline.run(), timeout=5.0)
+
+    assert first_run == 1
+    assert len(writer.reports) == 2
+
+
+# --- several markets on one bus (Design 4.7, F3-F)
+
+
+async def test_each_market_is_reported_by_each_producer() -> None:
+    writer, _, pipeline = two_market_pipeline(
+        {"svi-a": StubCalibrator(producer_id="svi-a"), "svi-b": StubCalibrator(producer_id="svi-b")}
+    )
+
+    await asyncio.wait_for(pipeline.run(), timeout=5.0)
+
+    assert sorted((report.market_id, report.producer_id) for report in writer.reports) == [
+        ("BTC-DERIBIT", "svi-a"),
+        ("BTC-DERIBIT", "svi-b"),
+        ("BTC-SYNTH", "svi-a"),
+        ("BTC-SYNTH", "svi-b"),
+    ]
+
+
+async def test_every_event_lands_on_the_topic_of_its_own_market() -> None:
+    _, bus, pipeline = two_market_pipeline({CALIBRATOR_NAME: StubCalibrator()})
+
+    await asyncio.wait_for(pipeline.run(), timeout=5.0)
+
+    for topic, event in bus.carried:
+        assert topic == topic_of(event)
+    surfaces = bus.events_of(SurfaceCalibrated)
+    assert {surface.surface.market_id for surface in surfaces} == {"BTC-DERIBIT", "BTC-SYNTH"}
+    assert all(one.surface.source_snapshot_id.startswith(one.surface.market_id) for one in surfaces)
+
+
+async def test_a_market_s_calibration_state_is_its_own() -> None:
+    """Per-market state: each market's first fit is cold, whichever market fitted first.
+
+    One calibrator object serves both markets here, so if the warm start were held per producer
+    rather than per market and producer, the second market's first fit would be handed the
+    first market's parameters.
+    """
+    shared = StubCalibrator()
+    _, _, pipeline = two_market_pipeline({CALIBRATOR_NAME: shared})
+
+    await asyncio.wait_for(pipeline.run(), timeout=5.0)
+
+    assert shared.calls == [None, None]
+
+
+async def test_the_producers_are_compared_on_each_market_separately() -> None:
+    metrics = RecordingMetrics()
+    _, _, pipeline = two_market_pipeline(
+        {
+            "svi-a": StubCalibrator(producer_id="svi-a"),
+            "svi-b": StubCalibrator(producer_id="svi-b"),
+        },
+        metrics=metrics,
+    )
+
+    await asyncio.wait_for(pipeline.run(), timeout=5.0)
+
+    compared = {
+        tags["market"]
+        for name, _, tags in metrics.gauges
+        if name == "risk.comparison.distance_rms_vol_bp"
+    }
+    assert compared == {"BTC-DERIBIT", "BTC-SYNTH"}
+
+
+# --- the timers, and the run that must not have them (F3-F)
+
+
+async def test_without_timers_neither_the_heartbeat_nor_rediscovery_runs() -> None:
+    """``timers=False`` is the replay's: no task polls, whatever the file configures.
+
+    Both timers are configured and the feed blocks, so with timers on this session would emit a
+    heartbeat snapshot and rediscover a moved universe. Only the duration moves the clock.
+    """
+    both = [make_instrument(kind=kind) for kind in (OptionKindD.CALL, OptionKindD.PUT)]
+    provider = ShiftingProvider(
+        updates=two_sided(), universes=[both, [make_instrument()]], block=True
+    )
+    metrics = RecordingMetrics()
+    config = make_app_config(
+        markets=(
+            make_market_config(
+                max_quiet_seconds=10.0, material_move_threshold=10.0, rediscovery_seconds=5.0
+            ),
+        )
+    )
+    pipeline = build_pipeline(
+        config,
+        make_adapters(provider, {CALIBRATOR_NAME: StubCalibrator()}, RecordingWriter()),
+        ManualClock(NOW),
+        InProcessConflatingBus(metrics),
+        metrics,
+        timers=False,
+    )
+
+    await asyncio.wait_for(pipeline.run(duration_seconds=60.0), timeout=5.0)
+
+    assert provider.discoveries == 1
+    assert "pipeline.heartbeat.emitted" not in metrics.counter_names()
+
+
+async def test_with_timers_the_same_session_does_poll() -> None:
+    """The guard on the test above: the identical session with timers on does both things."""
+    both = [make_instrument(kind=kind) for kind in (OptionKindD.CALL, OptionKindD.PUT)]
+    provider = ShiftingProvider(
+        updates=two_sided(), universes=[both, [make_instrument()]], block=True
+    )
+    metrics = RecordingMetrics()
+    config = make_app_config(
+        markets=(
+            make_market_config(
+                max_quiet_seconds=10.0, material_move_threshold=10.0, rediscovery_seconds=5.0
+            ),
+        )
+    )
+    pipeline = build_pipeline(
+        config,
+        make_adapters(provider, {CALIBRATOR_NAME: StubCalibrator()}, RecordingWriter()),
+        ManualClock(NOW),
+        InProcessConflatingBus(metrics),
+        metrics,
+    )
+
+    await asyncio.wait_for(pipeline.run(duration_seconds=60.0), timeout=5.0)
+
+    assert provider.discoveries > 1
+    assert "pipeline.heartbeat.emitted" in metrics.counter_names()

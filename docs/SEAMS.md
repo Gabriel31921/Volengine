@@ -41,24 +41,21 @@ close naturally in a later phase.
   minute at the full chain and not a file for plain git; whether it lives in LFS, an artefact
   bucket or as a longer narrowed excerpt is the owner's decision, and the admissibility numbers in
   `examples/deribit-live.toml` are measured on the thirty seconds, not on the hour.
-- **The ingestion loop consumes a full Deribit chain at about the rate the venue produces it.**
-  Measured while recording the fixture: 928 instruments tick at ~450 updates/s, and
-  `IngestStreamUseCase` alone -- no recorder, no fit -- replays 75 s of them in 88 s (432/s), so
-  live the receipt stamp `ts_local` falls behind the venue by 0.55 s every second, 38 s after 90 s.
-  The cost is `BuildSnapshotUseCase.build` computing full chain stats on *every* tick before the
-  policy consults the cadence -- the claim in `ingest_stream.py` that `should_emit` short-circuits
-  "long before it touches a quote" is not true of the call as written -- and the scipy fit holding
-  the GIL for seconds on a twelve-expiry chain makes it worse. Narrowed to two expiries the loop
-  keeps up with a flat 1.5 s lag. F3-F's hardening block owns it; a cadence check before the stats
-  is the obvious first move.
-- **A replay of a live recording can stall at one snapshot.** The first snapshot rests on the
-  first quote the venue sent, the movement filter measures only the instruments in the baseline
-  that snapshot left, and `cli._without_heartbeat` drops the timer that would rescue a live run --
-  so `volengine replay` over `examples/deribit-live.toml` publishes the one-quote degraded snapshot
-  and nothing after it unless that first instrument moves by the threshold. The E2E opens the
-  filter (`material_move_threshold = 0.0`) and says so; the same file live is rescued by
-  `max_quiet_seconds`. Recording the heartbeat's occasions in the file is the closing move already
-  named under `_without_heartbeat` below.
+- **A provider that never suspends holds the event loop until its stream ends.** `RecordedProvider`
+  awaits nothing between quotes, and neither does `SyntheticProvider` at `interval_seconds = 0`, so
+  the ingestion task runs the whole file without yielding: every snapshot is published, each
+  overwrites the last in the calibrators' one-slot mailboxes, and the fit sees only the final one.
+  Measured by F3-F on the golden fixture: 25 snapshots, one surface, one report. Beside a second
+  market the replayed one runs to its end before the other's ingestion or any fit gets a turn. Live
+  feeds await the network and are unaffected. Yielding once per quote would restore the live
+  interleaving, and with it the dependence of a replay's report count on how fast the machine fits
+  -- the replay is deterministic today partly *because* of the starvation, which is a choice
+  between ADR-004's determinism and ADR-003/005's fidelity rather than a fix, and is the owner's.
+- **A recording holds one market, so two markets cannot be replayed together.** A multi-market
+  replay needs one timeline merged from two files, ordered by instant, driving one clock; nothing
+  builds it. `tests/entrypoints/test_multi_market.py` runs the venue from the fixture beside a
+  synthetic market whose stamps push the shared clock forward (`ClockSettingProvider`, a test
+  builder), which is the shape such a merge would take.
 - **`DeribitProvider` reports through a `MetricsSink` nobody wires.** Reconnects, silence, refused
   channels and dropped frames are counted through the context's own port, and the registry cannot
   hand a provider the engine's sink -- `ProviderFactory` receives a `MarketConfig` and nothing else
@@ -116,6 +113,17 @@ close naturally in a later phase.
   tolerance, and the exclusion of the reserved rows is asserted exactly on one reservation instead.
   Closing it means giving up single precision or fixing the reduction order, and both cost more
   than the identity is worth.
+- **The scipy calibrator cannot fit a slice under about three days.** Found by F3-F's short-tenor
+  audit. Its cold start (`B_START_MIN = 0.05`, `SIGMA_START = 0.10`) and the ridge that holds a fit
+  near it are in absolute total variance, sized for tenors of a week or more, and a one-day slice has
+  about a hundredth of that variance: the fit comes back "converged" thousands of basis points off
+  and the acceptance rule refuses it. Measured on synthetic chains at 50 % vol: a twenty-hour slice
+  fails with any noise and any shape, a three-day one fails with skew, a seven-day one fits every
+  shape tried. On a live Deribit chain the nearest expiry is a daily nearly all day, so it would be
+  dropped from every surface and the surface published `DEGRADED`. The volatilities reaching the
+  calibrator are right -- the daycount and the 08:00 UTC expiry were audited and hold -- so the fix
+  is a start and a ridge scaled by the slice's own variance, in this adapter.
+  `tests/entrypoints/test_short_tenors.py` holds it as a strict `xfail`.
 - **The JAX cold cycle is "after a failure" and never "periodic".** Design 5.6 asks for both, and a
   `Calibrator` reads no clock and keeps no state (the port forbids it), so a pure function cannot
   know that an interval has elapsed. The half that is expressible is implemented: a warm start that
@@ -200,6 +208,22 @@ close naturally in a later phase.
 - **Risk's numerical greeks carry the grid's kinks** as well as the bump's truncation error. The
   at-the-money gamma of the test surface is about twice the analytic value — a fact Design §7.4
   wants visible, not a defect.
+- **A `DEGRADED` surface is valued into a `NORMAL` report.** `SurfaceView` carries no status, on
+  the argument that `ts_snapshot` already says everything a status would. That holds for
+  `STALE_REPUBLISH`, which ADR-006 publishes under its original instant, and not for `DEGRADED` --
+  a fit to a degraded snapshot, or a surface missing an expiry whose slice was refused -- which is
+  not a matter of age. The label reaches Risk's cache, where `risk.surface.received{status}` counts
+  it, and stops there. Found by F3-F's review of the degraded paths on the golden fixture
+  (`tests/entrypoints/test_degraded_paths_on_real_data.py`), and left: closing it changes Risk.
+- **Below the first grid node, a tenor is measured from the venue's stamp rather than our receipt.**
+  Market Data measures every tenor from the snapshot's `ts_local`; the published instant, and so
+  Risk's tenor zero, is the venue's `ts_exchange` (ADR-021). `SurfaceView.tenor_of` reproduces the
+  market's daycount exactly at and between nodes, and before the first one it extrapolates from
+  `(ts_snapshot, 0)`, off by `skew * (E1 - E) / (E1 - ts_snapshot)` -- never more than the skew
+  itself. On a one-day option that is 17 ppm at the fixture's median skew of 1.5 s and 0.65 per
+  mille at the example's 60 s tolerance. Small and bounded, which is what Design §11 risk 2
+  predicted; closing it moves either Market Data's tenor origin or Risk's extrapolation
+  (`tests/entrypoints/test_short_tenors.py`).
 - **The comparative report is measured, not written.** `build_pipeline` runs a
   `CompareProducersUseCase` whenever a market has two or more producers -- the first configured
   calibrator is the baseline, every other one a challenger -- each time a surface arrives, and the
@@ -245,22 +269,21 @@ close naturally in a later phase.
   of one file write the same bytes with nothing pinned from a test
   (`tests/entrypoints/test_replay.py`). What stays open is the *live* run: a `SystemClock` session
   is reproducible only by recording it first, and a `ManualClock` one only by a test holding both
-  ends, because a TOML file still has no way to name the engine's clock. **And conflation is
-  reproduced rather than removed**: a replay delivers its quotes as fast as the consumer takes
-  them, so a snapshot published while the previous fit is still on its pool is overwritten in a
-  one-slot mailbox (ADR-003), and how many reports a long recording produces is still a function
-  of how fast the machine fits. The test above is byte-exact because its session is one snapshot,
-  one fit, one report — the same construction `test_determinism.py` relies on. Closing it for a
-  long recording means a replay that awaits each handler before pulling the next quote, which is a
-  second path through `Pipeline` and would no longer be reproducing the engine that ran.
-- **A replay runs without the heartbeat, and `cli._without_heartbeat` is where that is decided.**
-  Under a `SimulatedClock` nothing but the recording moves time, so the timer racing the stream
-  either never fires or spins — and whether it fired at all would depend on how the event loop
-  interleaved two tasks, which is the non-determinism the command exists to remove. The cost is
-  real and unmeasured: the snapshots the heartbeat emitted during the original session are not
-  reproduced by its replay, so a recording of a market that went quiet replays as a shorter
-  sequence of snapshots than it produced. Closing it means recording the heartbeat's own occasions
-  as events in the file, which is a second line kind and a second thing to keep in step.
+  ends, because a TOML file still has no way to name the engine's clock. **And the live interleaving is
+  not reproduced**: F3-B's reading was that a replay's snapshots race the fit pool as a live
+  session's do, so that how many reports a long recording produces depends on how fast the machine
+  fits. F3-F measured otherwise -- a replay fits only its *last* snapshot, because the replayed feed
+  never yields the loop (the Market Data entry on a provider that never suspends). That makes the
+  report deterministic for a reason that is not the one it was believed to have, and the choice
+  between the two is recorded there.
+- **A replay runs no timer, and keeps the heartbeat's rule.** `build_pipeline(timers=False)` is
+  what `volengine replay` builds: no heartbeat task and no rediscovery poll, because under a
+  `SimulatedClock` only the recording moves time and a timer would fire on the loop's schedule
+  rather than the session's. `max_quiet_seconds` stays in the snapshot policy and is asked on every
+  recorded tick at that tick's instant (F3-F; before it the replay dropped the setting and a live
+  recording stalled at its first snapshot). What is still not reproduced is a heartbeat a live
+  timer fired during a gap with *no tick at all* -- the replay emits on the next tick instead --
+  and any universe change rediscovery found, since a recording carries one instrument set.
 - **A provider's settings are a named field, one per adapter.** `MarketConfig.synthetic` names the
   one adapter it configures, and a second provider with settings gets a second field rather than a
   shared untyped bag. That keeps every value validated where the error can name its table, and it
@@ -292,6 +315,11 @@ close naturally in a later phase.
   and names registered adapters, never the date. Closing this for good means either a config field
   expressed as an offset from start-up (which the composition root would resolve against
   `SystemClock`) or accepting the periodic bump as the cost of a literal example file.
+- **`[calibration]` and `[risk]` are one table for the whole engine, not one per market.** Every
+  market is fitted with the same tuning, weights, grid and acceptance, and valued under the same
+  freshness policy. `examples/multi-market.toml` shows the cost: the synthetic market runs on the
+  venue's wider Huber scale and larger budget, which it does not need. Per-market calibration
+  state, grids and books are real (Design 4.7); per-market *thresholds* for them are not.
 - **The CSV metrics sink has no TOML or CLI home.** `platform/adapters/csv_metrics_sink.py` writes
   every measurement to a file stamped by the engine's clock, and `--metrics` still selects between
   `LoggingMetricsSink` and the null sink. Selecting it needs a path in the configuration and the

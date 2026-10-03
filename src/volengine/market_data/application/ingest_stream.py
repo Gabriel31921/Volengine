@@ -104,7 +104,10 @@ class IngestStreamUseCase:
            it was supposed to describe.
         2. **Fold each update into the chain**, then ask the snapshot cycle whether that update
            made the chain worth publishing. Asking after every single tick is not as expensive as
-           it looks: ``should_emit`` short-circuits on the cadence long before it touches a quote.
+           it looks: ``BuildSnapshotUseCase.build`` asks the cadence first, then the movement, and
+           only then pays for the chain's stats, so a tick inside the cadence costs one
+           subtraction (F3-F -- before it, every tick paid for the stats, and a full Deribit chain
+           held the loop at the rate the venue produced it).
         3. **Announce an instrument that was born mid-session.** A strike listed between two
            discovery polls still trades, and ``QuoteChain.apply`` registers it on the spot rather
            than dropping its quotes to keep a tidy inventory. The chain therefore knows about it

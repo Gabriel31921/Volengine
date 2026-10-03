@@ -83,21 +83,33 @@ class BuildSnapshotUseCase:
         times a second and the cadence lets a fraction of those through. It is not an error, not a
         degraded state, and nothing upstream should log it.
 
-        The sequence of decisions, in order, and why it is this order:
+        The sequence of decisions, in order, and why it is this order. It is shaped by one fact:
+        this runs on **every tick** of the feed, and on a live Deribit chain that is hundreds of
+        times a second against a one-second cadence (F3-F, ``docs/SEAMS.md`` before it was closed).
+        Each step is therefore cheaper than the one after it, and each can end the cycle.
 
         1. **Read the clock once.** Every rule below is evaluated against one instant. Reading it
            twice would let the cadence and the freshness of the same snapshot disagree by however
            long the assembly took.
-        2. **Ask the policy.** ``should_emit`` sees the stats, the movement since the baseline and
-           the last emission. Nothing here second-guesses it.
-        3. **Freeze the chain** only once the answer is yes -- ``snapshot()`` costs the same as
-           ``stats()`` again, and there is no reason to pay it for a cycle that publishes nothing.
-        4. **Refuse to publish an empty snapshot.** A view with no slices is legal -- every expiry
+        2. **Ask the cadence**, which is one subtraction. On all but a handful of ticks the answer
+           is no and the cycle ends here without touching a quote.
+        3. **Ask the rest of the timing half** -- heartbeat and movement
+           (``SnapshotPolicy.is_due``). The move is one pass over the baseline mids and judges no
+           admissibility rule, so a calm market is refused here rather than paying for the stats
+           on every tick until it moves.
+        4. **Freeze the chain** only once the timing says yes. ``snapshot()`` carries the same
+           ``ChainStats`` that ``stats()`` would compute -- both come from one pass over the slices
+           at one instant -- so the coverage half of the policy is asked on the frozen view's own
+           stats, and the expensive pass is paid only on a cycle the timing has already let through.
+        5. **Ask the whole policy.** ``should_emit`` is the plain conjunction of the timing half and
+           the coverage test, so steps 2 and 3 are an ordering of the same rule and never a second
+           one; nothing here second-guesses its answer.
+        6. **Refuse to publish an empty snapshot.** A view with no slices is legal -- every expiry
            may be waiting for its first forward -- and it is useless: a calibrator handed it can
            only fail, and the failure would be attributed to the calibrator. The baseline and
            ``last_emit`` are deliberately *not* advanced in that case, so the next update that
            produces a usable slice emits immediately instead of waiting out another cadence.
-        5. **Translate, then advance the state.** In that order, so that a snapshot which fails
+        7. **Translate, then advance the state.** In that order, so that a snapshot which fails
            its own DTO invariants leaves the use case exactly as it was rather than half-committed
            with a consumed sequence number and a reset baseline.
 
@@ -110,13 +122,18 @@ class BuildSnapshotUseCase:
                 swallowing it would publish silence for a market that is ticking perfectly well.
         """
         now = self._clock.now()
-        stats = self._chain.stats(now)
-        move = self._chain.max_relative_move_since_baseline()
+        if not self._policy.cadence_elapsed(self._last_emit, now):
+            return None
 
-        if not self._policy.should_emit(stats, move, self._last_emit, now):
+        move = self._chain.max_relative_move_since_baseline()
+        if not self._policy.is_due(move, self._last_emit, now):
             return None
 
         snapshot = self._chain.snapshot(now)
+        stats = snapshot.stats
+        if not self._policy.should_emit(stats, move, self._last_emit, now):
+            return None
+
         if not snapshot.slices:
             self._metrics.counter("marketdata.snapshot.empty", market=snapshot.market_id)
             return None

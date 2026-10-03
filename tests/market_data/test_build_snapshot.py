@@ -26,7 +26,7 @@ from tests.market_data.builders import (
 from tests.support import RecordingMetrics
 from volengine.market_data.application.build_snapshot import BuildSnapshotUseCase
 from volengine.market_data.domain.option_quote import OptionKindD
-from volengine.market_data.domain.quote_chain import ChainSnapshot, QuoteChain
+from volengine.market_data.domain.quote_chain import ChainSnapshot, ChainStats, QuoteChain
 from volengine.market_data.domain.snapshot_policy import SnapshotPolicy
 from volengine.platform.clock import ManualClock
 
@@ -199,6 +199,77 @@ def test_publishing_resets_the_movement_baseline() -> None:
     clock.advance(10.0)
 
     assert use_case.build() is None
+
+
+# --- what a tick costs (F3-F)
+#
+# The ingestion loop asks `build()` after every update, and a live Deribit chain sends hundreds a
+# second. Building the view -- `stats()` or `snapshot()`, each one pass of every admissibility rule
+# over the chain -- on every one of them is what held the loop at the venue's own rate. These pin
+# that the view is built only once the cheap half of the policy has said yes.
+
+
+class CountingChain(QuoteChain):
+    """A chain that counts how often the expensive view was asked for, and nothing else."""
+
+    views = 0
+
+    def stats(self, now: datetime) -> ChainStats:
+        self.views += 1
+        return super().stats(now)
+
+    def snapshot(self, now: datetime) -> ChainSnapshot:
+        self.views += 1
+        return super().snapshot(now)
+
+
+def counting_use_case(
+    material_move_threshold: float = 0.0,
+) -> tuple[BuildSnapshotUseCase, CountingChain, ManualClock]:
+    chain = CountingChain(make_conventions(), make_thresholds())
+    policy = make_snapshot_policy(
+        cadence_seconds=1.0, material_move_threshold=material_move_threshold
+    )
+    use_case, _, clock, _ = make_use_case(chain=chain, policy=policy)
+    quote_the_chain(chain)
+    assert use_case.build() is not None
+    chain.views = 0
+    return use_case, chain, clock
+
+
+def test_a_tick_inside_the_cadence_does_not_build_the_view() -> None:
+    use_case, chain, clock = counting_use_case()
+
+    for _ in range(100):
+        clock.advance(0.001)
+        quote_the_chain(chain)
+        assert use_case.build() is None
+
+    assert chain.views == 0
+
+
+def test_a_motionless_chain_past_the_cadence_does_not_build_the_view() -> None:
+    """A calm market is refused by the movement half, before the stats, on every tick."""
+    use_case, chain, clock = counting_use_case(material_move_threshold=0.01)
+
+    for _ in range(100):
+        clock.advance(0.5)
+        quote_the_chain(chain)
+        assert use_case.build() is None
+
+    assert chain.views == 0
+
+
+def test_a_cycle_the_timing_lets_through_builds_the_view_once() -> None:
+    """The guard on the two above: the counter does count, and a published cycle pays once --
+    the coverage half of the policy is read off the frozen view rather than computed again."""
+    use_case, chain, clock = counting_use_case(material_move_threshold=0.01)
+
+    clock.advance(2.0)
+    quote_the_chain(chain, mid=0.060)
+
+    assert use_case.build() is not None
+    assert chain.views == 1
 
 
 # --- identity and state

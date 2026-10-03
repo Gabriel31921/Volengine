@@ -22,7 +22,13 @@ class NamedExecutors:
     because the use case chains warm-start state from one snapshot to the next. Two of them
     racing would interleave that state. Parallelism here is *across* producers, not within.
 
-    Only the abstraction is used in phase 1; it is wired for real in F3-F.
+    Keyed by producer and not by market, which is ADR-005 read literally: with two markets fitted
+    by one producer, both queue on that producer's one worker, each with its own calibration state
+    -- the state is per market, the thread is per producer. ``entrypoints/pipeline.py`` looks a
+    pool up on every fit rather than holding one, because :meth:`shutdown` forgets the pools and
+    the next lookup is what builds a fresh one for the next run.
+    ``tests/entrypoints/test_pipeline.py`` asserts both the parallelism across producers and the
+    sharing across markets (F3-F).
     """
 
     def __init__(self, max_workers_per_pool: int = 1) -> None:

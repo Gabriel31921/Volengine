@@ -1,4 +1,6 @@
-# volengine -- [documentation](https://gabriel31921.github.io/Volengine/)
+# volengine
+
+API documentation: <https://gabriel31921.github.io/Volengine/>
 
 A real-time, multi-market implied volatility surface calibration engine, built with Hexagonal
 Architecture and Domain-Driven Design (DDD).
@@ -195,11 +197,25 @@ surface each side was valued off for exactly this reason.
 ### Charts
 
 Every chart is drawn from a metrics file and nothing else, by `benchmarks/charts.py`, which works on
-any session recorded with `[metrics] sink = "csv"`:
+any session recorded with `[metrics] sink = "csv"`. Both sessions above produce the same four,
+and the parametric-vs-neural one adds the two that only a network emits.
+
+**Parametric vs. neural** -- the network's cold start and its first restart, the drift that
+restart causes, and the gate that found nothing to refuse:
 
 ![Fit RMSE per surface, parametric vs. neural](benchmarks/results/parametric-vs-neural-rmse.svg)
 ![Distance between producers, parametric vs. neural](benchmarks/results/parametric-vs-neural-distance.svg)
+![Neural restart drift](benchmarks/results/parametric-vs-neural-restart-drift.svg)
+![Neural butterfly depth on the gate's mesh](benchmarks/results/parametric-vs-neural-neural-gate.svg)
+![SVI calibration cycle time in the parametric-vs-neural session (the network reports no cycle time)](benchmarks/results/parametric-vs-neural-cycle-ms.svg)
+![Snapshot to surface, parametric vs. neural](benchmarks/results/parametric-vs-neural-snapshot-to-surface.svg)
+
+**scipy vs. JAX** -- the same answer at very different costs:
+
+![Fit RMSE per surface, scipy vs. JAX](benchmarks/results/scipy-vs-jax-rmse.svg)
 ![Calibration cycle time, scipy vs. JAX](benchmarks/results/scipy-vs-jax-cycle-ms.svg)
+![Distance between producers, scipy vs. JAX](benchmarks/results/scipy-vs-jax-distance.svg)
+![Snapshot to surface, scipy vs. JAX](benchmarks/results/scipy-vs-jax-snapshot-to-surface.svg)
 
 ## Running it
 

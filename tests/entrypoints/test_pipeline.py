@@ -38,6 +38,7 @@ from tests.entrypoints.builders import (
     make_app_config,
     make_calibration_config,
     make_market_config,
+    make_neural_config,
     make_position,
     make_risk_config,
     make_synthetic_settings,
@@ -52,6 +53,7 @@ from tests.market_data.builders import (
     make_deribit_settings,
     make_instrument,
 )
+from tests.neural_surface.builders import StubLearner
 from tests.parametric_pricing.builders import (
     StubCalibrator,
     make_calibration_task,
@@ -70,9 +72,11 @@ from volengine.entrypoints.config import (
     DERIBIT_PROVIDER,
     JAX_CALIBRATOR,
     SYNTHETIC_PROVIDER,
+    TORCH_LEARNER,
     AppConfig,
     ConfigError,
     MarketConfig,
+    NeuralConfig,
 )
 from volengine.entrypoints.pipeline import (
     Adapters,
@@ -490,8 +494,8 @@ def test_a_market_with_nothing_in_the_book_is_refused() -> None:
 
 
 def test_the_default_registry_holds_every_adapter_this_build_can_make() -> None:
-    """The eight names a shipped configuration may use: F1-08's three, F2's three, F3-C's venue and
-    F3-W1's JAX calibrator.
+    """The nine names a shipped configuration may use: F1-08's three, F2's three, F3-C's venue,
+    F3-W1's JAX calibrator and F3-W2's torch learner.
 
     Names rather than objects: the factories are what ``build_pipeline`` calls, and asserting on
     what they build here would only repeat the end-to-end tests in ``test_walking_skeleton.py``
@@ -503,6 +507,7 @@ def test_the_default_registry_holds_every_adapter_this_build_can_make() -> None:
     assert set(adapters.providers) == {"constant", "synthetic", "deribit"}
     assert set(adapters.calibrators) == {"flat-vol", "svi-scipy", "svi-jax"}
     assert set(adapters.writers) == {"console", "csv"}
+    assert set(adapters.learners) == {"mlp-torch"}
 
 
 async def test_a_report_goal_of_zero_is_a_caller_mistake() -> None:
@@ -1108,3 +1113,234 @@ async def test_with_timers_the_same_session_does_poll() -> None:
 
     assert provider.discoveries > 1
     assert "pipeline.heartbeat.emitted" in metrics.counter_names()
+
+
+# --- the neural producer (F3-W2)
+
+
+def make_neural_pipeline(
+    learner: StubLearner,
+    markets: tuple[MarketConfig, ...] | None = None,
+    calibrators: tuple[str, ...] = (CALIBRATOR_NAME, "mlp-stub"),
+) -> tuple[RecordingWriter, RecordingMetrics, Pipeline]:
+    """A stub fit and a stub network on one market, both out of the registry by name.
+
+    ``StubLearner`` comes from Neural Surface's builders and needs no torch, so the wiring is
+    tested on every installation; the real learner's factory has tests of its own below.
+    """
+    writer, metrics = RecordingWriter(), RecordingMetrics()
+    adapters = replace(
+        make_adapters(
+            StubProvider(updates=two_sided(), instruments=one_instrument()),
+            {CALIBRATOR_NAME: SlowCalibrator()},
+            writer,
+        ),
+        learners={"mlp-stub": lambda _neural: learner},
+    )
+    config = make_app_config(
+        markets=markets,
+        calibration=make_calibration_config(calibrators=calibrators),
+        neural=make_neural_config(),
+    )
+    pipeline = build_pipeline(
+        config, adapters, ManualClock(NOW), InProcessConflatingBus(metrics), metrics
+    )
+    return writer, metrics, pipeline
+
+
+async def test_a_learner_is_reported_on_beside_a_calibrator() -> None:
+    """The second producer kind publishes onto the same topics, and Risk cannot tell them apart."""
+    writer, _, pipeline = make_neural_pipeline(StubLearner())
+
+    await asyncio.wait_for(pipeline.run(), timeout=5.0)
+
+    assert {report.producer_id for report in writer.reports} == {"svi-stub", "mlp-stub"}
+
+
+async def test_a_learner_is_compared_against_the_baseline_calibrator() -> None:
+    """Design 7.3 between the two engines: the comparison series names the network as challenger."""
+    _, metrics, pipeline = make_neural_pipeline(StubLearner())
+
+    await asyncio.wait_for(pipeline.run(), timeout=5.0)
+
+    compared = [tags for name, _, tags in metrics.gauges if name.startswith("risk.comparison.")]
+    assert compared
+    assert {(tags["baseline"], tags["challenger"]) for tags in compared} == {
+        ("svi-stub", "mlp-stub")
+    }
+
+
+async def test_a_learner_is_trained_on_the_snapshot_through_the_use_case() -> None:
+    """The guard on the two above: the network really was asked, with a batch of this market."""
+    learner = StubLearner()
+    _, _, pipeline = make_neural_pipeline(learner)
+
+    await asyncio.wait_for(pipeline.run(), timeout=5.0)
+
+    assert learner.calls
+    previous, batch = learner.calls[0]
+    assert previous is None
+    assert batch.market_id == MARKET_ID
+
+
+async def test_each_market_trains_its_own_network_from_scratch() -> None:
+    """Per-market training state (Design 4.7): one learner object, two lineages.
+
+    The factory hands both markets the same stub, so the only thing that can make each market's
+    first step a cold start is a ``TrainingState`` per market.
+    """
+    learner = StubLearner()
+    markets = (
+        make_market_config(),
+        make_market_config(market_id="BTC-OTHER"),
+    )
+    _, _, pipeline = make_neural_pipeline(learner, markets=markets, calibrators=("mlp-stub",))
+
+    await asyncio.wait_for(pipeline.run(), timeout=5.0)
+
+    first_per_market: dict[str, object] = {}
+    for previous, batch in learner.calls:
+        first_per_market.setdefault(batch.market_id, previous)
+    assert set(first_per_market) == {MARKET_ID, "BTC-OTHER"}
+    assert all(previous is None for previous in first_per_market.values())
+
+
+def test_a_learner_listed_without_a_neural_table_is_refused() -> None:
+    adapters = replace(
+        make_adapters(StubProvider(updates=()), {}, RecordingWriter()),
+        learners={"mlp-stub": lambda _neural: StubLearner()},
+    )
+    config = make_app_config(calibration=make_calibration_config(calibrators=("mlp-stub",)))
+
+    with pytest.raises(ConfigError, match=r"needs a \[neural\] table"):
+        build_pipeline(
+            config,
+            adapters,
+            ManualClock(NOW),
+            InProcessConflatingBus(RecordingMetrics()),
+            RecordingMetrics(),
+        )
+
+
+def test_a_name_registered_as_both_a_calibrator_and_a_learner_is_refused() -> None:
+    """One name, two producers: which one ran would be decided by the order of two lookups."""
+    adapters = replace(
+        make_adapters(
+            StubProvider(updates=()), {CALIBRATOR_NAME: StubCalibrator()}, RecordingWriter()
+        ),
+        learners={CALIBRATOR_NAME: lambda _neural: StubLearner()},
+    )
+
+    with pytest.raises(ConfigError, match="both as a calibrator and a learner"):
+        build_pipeline(
+            make_app_config(neural=make_neural_config()),
+            adapters,
+            ManualClock(NOW),
+            InProcessConflatingBus(RecordingMetrics()),
+            RecordingMetrics(),
+        )
+
+
+def test_an_unregistered_producer_lists_the_learners_among_the_known_names() -> None:
+    adapters = replace(
+        make_adapters(
+            StubProvider(updates=()), {CALIBRATOR_NAME: StubCalibrator()}, RecordingWriter()
+        ),
+        learners={"mlp-stub": lambda _neural: StubLearner()},
+    )
+    config = make_app_config(calibration=make_calibration_config(calibrators=("mlp-typo",)))
+
+    with pytest.raises(ConfigError, match="known: mlp-stub, svi-stub"):
+        build_pipeline(
+            config,
+            adapters,
+            ManualClock(NOW),
+            InProcessConflatingBus(RecordingMetrics()),
+            RecordingMetrics(),
+        )
+
+
+HAS_TORCH_EXTRA = find_spec("torch") is not None
+
+
+@pytest.mark.skipif(not HAS_TORCH_EXTRA, reason="needs the neural extra")
+def test_the_registry_key_is_the_name_the_torch_learner_gives_itself() -> None:
+    """Spelled twice, as ``svi-jax`` is, and held together here for the same reason."""
+    torch_learner = pytest.importorskip("volengine.neural_surface.adapters.torch_learner")
+
+    assert torch_learner.PRODUCER_ID == TORCH_LEARNER
+
+
+@pytest.mark.skipif(not HAS_TORCH_EXTRA, reason="needs the neural extra")
+def test_the_torch_learner_is_handed_the_mesh_and_the_tuning_the_file_states(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``[neural]`` reaches the learner rather than being parsed and dropped.
+
+    ``TorchLearner`` keeps its settings private, so the constructor is observed instead: the
+    factory imports the class lazily, from the module attribute this test replaces.
+    """
+    torch_learner = pytest.importorskip("volengine.neural_surface.adapters.torch_learner")
+    seen: dict[str, object] = {}
+
+    def recording(**kwargs: object) -> StubLearner:
+        seen.update(kwargs)
+        return StubLearner(producer_id=TORCH_LEARNER)
+
+    monkeypatch.setattr(torch_learner, "TorchLearner", recording)
+    fit = torch_learner.TorchFitSettings(warm_steps=3)
+    network = torch_learner.NetworkSpec(hidden=(4,))
+    neural: NeuralConfig = replace(make_neural_config(), fit=fit, network=network)
+
+    default_adapters().learners[TORCH_LEARNER](neural)
+
+    assert seen == {"penalty_mesh": neural.mesh, "settings": fit, "spec": network}
+
+
+@pytest.mark.skipif(not HAS_TORCH_EXTRA, reason="needs the neural extra")
+def test_the_torch_learner_factory_builds_the_real_learner() -> None:
+    torch_learner = pytest.importorskip("volengine.neural_surface.adapters.torch_learner")
+
+    learner = default_adapters().learners[TORCH_LEARNER](make_neural_config())
+
+    assert isinstance(learner, torch_learner.TorchLearner)
+    assert learner.producer_id == TORCH_LEARNER
+
+
+def test_a_torch_learner_without_the_extra_is_refused_with_the_remedy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """At wiring time, naming the extra -- not an ``ImportError`` out of the first training step."""
+    monkeypatch.setattr(
+        config_module, "find_spec", lambda name: None if name == "torch" else find_spec(name)
+    )
+
+    with pytest.raises(ConfigError, match="uv sync --extra neural"):
+        default_adapters().learners[TORCH_LEARNER](make_neural_config())
+
+
+def test_the_whole_pipeline_refuses_mlp_torch_without_the_extra_before_anything_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The same refusal through ``build_pipeline``: a ``ConfigError``, so the CLI exits with 2."""
+    monkeypatch.setattr(
+        config_module, "find_spec", lambda name: None if name == "torch" else find_spec(name)
+    )
+    config = make_app_config(
+        calibration=make_calibration_config(calibrators=(TORCH_LEARNER,)),
+        neural=make_neural_config(),
+    )
+    registry = replace(
+        default_adapters(),
+        providers={PROVIDER_NAME: lambda _market: StubProvider(updates=())},
+        writers={WRITER_NAME: lambda _risk: RecordingWriter()},
+    )
+
+    with pytest.raises(ConfigError, match=r"calibrator 'mlp-torch': 'mlp-torch' needs torch"):
+        build_pipeline(
+            config,
+            registry,
+            ManualClock(NOW),
+            InProcessConflatingBus(RecordingMetrics()),
+            RecordingMetrics(),
+        )

@@ -38,6 +38,14 @@ without JAX fails with a ``ConfigError`` naming the extra rather than with an ``
 **The metrics sink is chosen here too** (``[metrics]``, F3-W1): a name, like the adapters, and a
 path when the name is ``csv``. Which object that becomes, and who closes it, is the CLI's business.
 
+**The neural producer's collaborators live under ``[neural]``** (F3-W2): the replay buffer's
+stratification, the arbitrage mesh, the gate's tolerances, the training schedule and the seed of
+the replay draw, each filling the type Neural Surface already declares. Two sub-tables --
+``[neural.network]`` and ``[neural.fit]`` -- fill types that live beside the torch learner, whose
+module imports ``torch`` at its top, so they are imported lazily on exactly the terms of
+``[calibration.jax]``: only when the file states them, and only after the ``neural`` extra has been
+found.
+
 **Every adapter section is optional, and complete when present.** Absent means "the adapter's
 own defaults", which are argued for in its docstring and are what every test bends one knob of; a
 partial table would need this module to restate every value the file left out, which is the mirror
@@ -74,6 +82,9 @@ from volengine.market_data.domain.market_conventions import (
     Numeraire,
 )
 from volengine.market_data.domain.snapshot_policy import SnapshotPolicyConfig
+from volengine.neural_surface.application.train_on_snapshot import GateThresholds, TrainingSchedule
+from volengine.neural_surface.domain.invariants import ArbitrageMesh
+from volengine.neural_surface.domain.replay_buffer import StratificationSpec
 from volengine.parametric_pricing.adapters.scipy_calibrator import FitSettings
 from volengine.parametric_pricing.application.acl import Weighting
 from volengine.parametric_pricing.application.calibrate_on_snapshot import Acceptance
@@ -89,6 +100,7 @@ if TYPE_CHECKING:
     # The JAX calibrator's module imports `jax` at its top, and `jax` is an optional extra: the
     # type is named here for the checker and imported at run time only by `_jax`, after the extra
     # has been found (see the module docstring).
+    from volengine.neural_surface.adapters.torch_learner import NetworkSpec, TorchFitSettings
     from volengine.parametric_pricing.adapters.jax_calibrator import JaxFitSettings
 
 
@@ -148,6 +160,36 @@ def require_jax_extra(where: str) -> None:
         raise ConfigError(
             f"{where}: {JAX_CALIBRATOR!r} needs {', '.join(missing)}, which the 'jax' extra "
             "installs: uv sync --extra jax"
+        )
+
+
+TORCH_LEARNER = "mlp-torch"
+"""The registry key of the neural producer, spelled here rather than imported from its module.
+
+The same arrangement as :data:`JAX_CALIBRATOR`: ``torch_learner.PRODUCER_ID`` cannot be read without
+importing ``torch``, an optional extra, and a test holds the two spellings together wherever the
+extra is installed.
+"""
+
+TORCH_EXTRA_LIBRARIES = ("torch",)
+"""What the ``neural`` extra installs, checked by name before anything that needs it is imported."""
+
+
+def require_torch_extra(where: str) -> None:
+    """Refuse, with the remedy, a configuration that needs torch on an installation without it.
+
+    :func:`require_jax_extra`'s twin, behind the same two doors: a ``[neural.network]`` or
+    ``[neural.fit]`` table, which cannot be parsed into its type without importing the learner's
+    module, and ``mlp-torch`` in the producer list, which cannot be built without it.
+
+    Raises:
+        ConfigError: If any library of the extra is missing.
+    """
+    missing = [name for name in TORCH_EXTRA_LIBRARIES if find_spec(name) is None]
+    if missing:
+        raise ConfigError(
+            f"{where}: {TORCH_LEARNER!r} needs {', '.join(missing)}, which the 'neural' extra "
+            "installs: uv sync --extra neural"
         )
 
 
@@ -355,6 +397,58 @@ class RiskConfig:
             raise ValueError("The output_path must not be empty")
 
 
+@dataclass(frozen=True, slots=True)
+class NeuralConfig:
+    """Everything the neural producer needs beyond what ``[calibration]`` already says (F3-W2).
+
+    The mesh the surfaces are published on and the weight each quote counts for are *not* here:
+    ``mlp-torch`` is listed in ``calibration.calibrators`` beside the parametric producers, and the
+    composition root hands it ``[calibration.grid]`` and ``[calibration.weighting]`` translated
+    into Neural Surface's own twins of those types. One table for both is what keeps Design 6.5's
+    comparison holding the weights and the nodes constant while the models vary; two tables could
+    only ever agree or be a mistake.
+
+    Each field is the type Neural Surface declares, with its invariants already in
+    ``__post_init__`` -- this is a reader, not a mirror.
+    """
+
+    buffer: StratificationSpec
+    """How the replay buffer cuts up the ``(k, T)`` plane, how much a cell holds, and how long."""
+
+    mesh: ArbitrageMesh
+    """Where the hard gate of ADR-010 judges a surface, and where the learner's soft tier trains.
+
+    One mesh for both on purpose. ``TorchLearner`` allows its penalty mesh to differ from the
+    gate's, and the composition root is where that choice is made; training against the very
+    points the gate will judge is the choice that cannot leave a breach the gate sees and the loss
+    never did. A second mesh is one field away the day a deployment wants a denser one to train on.
+    """
+
+    gate: GateThresholds
+    """How much butterfly and calendar arbitrage a surface may show and still be published."""
+
+    schedule: TrainingSchedule
+    """How many buffered points each step replays, and how often the model restarts from scratch."""
+
+    seed: int
+    """The seed of the generator the replay draw uses -- the one random step in the use case.
+
+    Not the network's: the cold-start weights are seeded by ``[neural.fit].init_seed``, inside the
+    learner, on a generator of its own. Two seeds because there are two generators and they belong
+    to two layers; one number feeding both would tie a change in the replay to a change in every
+    cold start. Each market gets its own generator from this seed, so adding a market does not
+    move the draws another one makes.
+    """
+
+    network: NetworkSpec | None = None
+    """The architecture and input scaling, from ``[neural.network]``, or ``None`` for the learner's
+    own defaults. Complete when present."""
+
+    fit: TorchFitSettings | None = None
+    """Step budgets, learning rates, soft-tier weights and the init seed, from ``[neural.fit]``, or
+    ``None`` for the learner's own defaults. Complete when present."""
+
+
 class MetricsSinkKind(StrEnum):
     """Where the engine's measurements go. Explicit values: they are what a file spells."""
 
@@ -423,6 +517,16 @@ class AppConfig:
     """Where measurements go. Absent ``[metrics]`` is the null sink, which is what every run did
     before the table existed; the CLI's ``--metrics``/``--no-metrics`` overrides it."""
 
+    neural: NeuralConfig | None = None
+    """The neural producer's collaborators, from ``[neural]``, or ``None`` when the file has none.
+
+    Required only by a configuration that runs a neural producer, and that is checked where the
+    producers are built (``pipeline.build_pipeline``), not here: which names are learners is the
+    registry's knowledge. Present beside a producer list that names no learner -- a file narrowed by
+    ``--calibrators`` -- it is read and unused, as ``[calibration.fit]`` is beside ``flat-vol``.
+    Shared by every market, like ``[calibration]``.
+    """
+
     def __post_init__(self) -> None:
         if not self.markets:
             raise ValueError("At least one market must be configured")
@@ -464,6 +568,7 @@ def load_config(path: Path) -> AppConfig:
             calibration=_calibration(_table(raw, "calibration", "the file")),
             risk=_risk(_table(raw, "risk", "the file")),
             metrics=_metrics(raw),
+            neural=_neural(raw),
         ),
     )
 
@@ -735,6 +840,132 @@ def _metrics(raw: Mapping[str, Any]) -> MetricsConfig:
     )
 
 
+def _neural(raw: Mapping[str, Any]) -> NeuralConfig | None:
+    """``[neural]``, or ``None`` when the file has no such table.
+
+    Present, its four sub-tables and its seed are required: none of the types they fill has a
+    default, because every one of their numbers is a judgement about a market -- where the wings
+    begin, how much arbitrage is tolerable, how long a quote stays informative.
+    """
+    settings = _optional_table(raw, "neural", "the file")
+    if settings is None:
+        return None
+    where = "neural"
+    buffer = _table(settings, "buffer", where)
+    mesh = _table(settings, "mesh", where)
+    gate = _table(settings, "gate", where)
+    schedule = _table(settings, "schedule", where)
+    return _built(
+        where,
+        lambda: NeuralConfig(
+            buffer=_built(
+                f"{where}.buffer",
+                lambda: StratificationSpec(
+                    moneyness_edges=_numbers(buffer, "moneyness_edges", f"{where}.buffer"),
+                    tenor_edges=_numbers(buffer, "tenor_edges", f"{where}.buffer"),
+                    capacity_per_cell=_integer(buffer, "capacity_per_cell", f"{where}.buffer"),
+                    max_age_seconds=_number(buffer, "max_age_seconds", f"{where}.buffer"),
+                ),
+            ),
+            mesh=_arbitrage_mesh(mesh, f"{where}.mesh"),
+            gate=_built(
+                f"{where}.gate",
+                lambda: GateThresholds(
+                    butterfly=_number(gate, "butterfly", f"{where}.gate"),
+                    calendar=_number(gate, "calendar", f"{where}.gate"),
+                ),
+            ),
+            schedule=_built(
+                f"{where}.schedule",
+                lambda: TrainingSchedule(
+                    replay_size=_integer(schedule, "replay_size", f"{where}.schedule"),
+                    # Absent means "never restart", which `TrainingSchedule` documents as a
+                    # different statement from a very long interval -- a choice a file makes by
+                    # omission, like an absent `max_quiet_seconds`.
+                    restart_seconds=_optional_number(
+                        schedule, "restart_seconds", f"{where}.schedule"
+                    ),
+                ),
+            ),
+            seed=_integer(settings, "seed", where),
+            network=_neural_network(settings, where),
+            fit=_neural_fit(settings, where),
+        ),
+    )
+
+
+def _arbitrage_mesh(raw: Mapping[str, Any], where: str) -> ArbitrageMesh:
+    """The gate's mesh, from a moneyness range and a node count plus the tenors themselves.
+
+    **The one table in this file whose keys are not the fields they fill**, and the reason is the
+    field: ``ArbitrageMesh.log_moneyness`` must be uniform to a part in a billion, so spelling it as
+    forty-one numbers in a file would ask an operator to type a uniform axis by hand and have the
+    domain refuse the typo. ``k_min``, ``k_max`` and ``n_nodes`` are the spelling
+    ``[calibration.grid]`` already uses for exactly that kind of axis, and the nodes are placed the
+    way ``GridSpec.nodes`` places them -- ``k_min + step * i``, with the last one assigned exactly.
+    The tenors are compared rather than differentiated, need no uniformity, and are listed as is.
+    """
+    k_min = _number(raw, "k_min", where)
+    k_max = _number(raw, "k_max", where)
+    n_nodes = _integer(raw, "n_nodes", where)
+    # Only the arithmetic's own precondition: one node would divide by zero below. Every other
+    # count -- two, which spans no interior point -- is refused by `ArbitrageMesh` itself, whose
+    # guard this does not restate.
+    if n_nodes < 2:
+        raise ConfigError(f"{where}: 'n_nodes' must be at least 2, got {n_nodes}")
+    step = (k_max - k_min) / (n_nodes - 1)
+    nodes = (*(k_min + step * index for index in range(n_nodes - 1)), k_max)
+    return _built(
+        where,
+        lambda: ArbitrageMesh(log_moneyness=nodes, tenors=_numbers(raw, "tenors", where)),
+    )
+
+
+def _neural_network(raw: Mapping[str, Any], where: str) -> NetworkSpec | None:
+    """``[neural.network]``, when the file states it -- complete, and only with the extra."""
+    settings = _optional_table(raw, "network", where)
+    if settings is None:
+        return None
+    place = f"{where}.network"
+    require_torch_extra(place)
+    # Imported here and not at the top: the module imports `torch`, an optional extra, and the
+    # check above is what turns its absence into a message instead of an `ImportError`.
+    from volengine.neural_surface.adapters.torch_learner import Activation, NetworkSpec
+
+    return _built(
+        place,
+        lambda: NetworkSpec(
+            hidden=_integers(settings, "hidden", place),
+            activation=_member(settings, "activation", place, Activation),
+            k_scale=_number(settings, "k_scale", place),
+            tenor_scale=_number(settings, "tenor_scale", place),
+        ),
+    )
+
+
+def _neural_fit(raw: Mapping[str, Any], where: str) -> TorchFitSettings | None:
+    """``[neural.fit]``, when the file states it -- complete, and only with the extra."""
+    settings = _optional_table(raw, "fit", where)
+    if settings is None:
+        return None
+    place = f"{where}.fit"
+    require_torch_extra(place)
+    from volengine.neural_surface.adapters.torch_learner import TorchFitSettings
+
+    return _built(
+        place,
+        lambda: TorchFitSettings(
+            cold_steps=_integer(settings, "cold_steps", place),
+            warm_steps=_integer(settings, "warm_steps", place),
+            cold_learning_rate=_number(settings, "cold_learning_rate", place),
+            warm_learning_rate=_number(settings, "warm_learning_rate", place),
+            butterfly_penalty=_number(settings, "butterfly_penalty", place),
+            calendar_penalty=_number(settings, "calendar_penalty", place),
+            init_seed=_integer(settings, "init_seed", place),
+        ),
+    )
+
+
 def _risk(raw: Mapping[str, Any]) -> RiskConfig:
     where = "risk"
     freshness = _table(raw, "freshness", where)
@@ -895,6 +1126,24 @@ def _texts(raw: Mapping[str, Any], key: str, where: str) -> tuple[str, ...]:
     value = _require(raw, key, where)
     if not isinstance(value, list) or not all(isinstance(entry, str) for entry in value):
         raise ConfigError(f"{where}: {key!r} must be an array of strings, got {value!r}")
+    return tuple(value)
+
+
+def _numbers(raw: Mapping[str, Any], key: str, where: str) -> tuple[float, ...]:
+    """An array of numbers, each read with the same guard as a single one (no booleans)."""
+    value = _require(raw, key, where)
+    if not isinstance(value, list):
+        raise ConfigError(f"{where}: {key!r} must be an array of numbers, got {value!r}")
+    return tuple(_as_number(entry, key, where) for entry in value)
+
+
+def _integers(raw: Mapping[str, Any], key: str, where: str) -> tuple[int, ...]:
+    """An array of integers. ``true`` is refused for the reason :func:`_as_number` gives."""
+    value = _require(raw, key, where)
+    if not isinstance(value, list) or not all(
+        isinstance(entry, int) and not isinstance(entry, bool) for entry in value
+    ):
+        raise ConfigError(f"{where}: {key!r} must be an array of integers, got {value!r}")
     return tuple(value)
 
 

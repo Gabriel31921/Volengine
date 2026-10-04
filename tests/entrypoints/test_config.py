@@ -28,6 +28,8 @@ from volengine.entrypoints.config import (
 from volengine.market_data.adapters.deribit_ws import DeribitSettings
 from volengine.market_data.adapters.synthetic import SVIParamsSpec
 from volengine.market_data.domain.market_conventions import DayCount, ForwardMethod, Numeraire
+from volengine.neural_surface.application.train_on_snapshot import GateThresholds, TrainingSchedule
+from volengine.neural_surface.domain.replay_buffer import StratificationSpec
 from volengine.risk.domain.pricing import OptionKindR
 
 
@@ -635,3 +637,248 @@ def test_an_unknown_sink_lists_the_three_there_are(tmp_path: Path) -> None:
 def test_a_blank_metrics_path_is_refused_by_name(tmp_path: Path) -> None:
     with pytest.raises(ConfigError, match="metrics: 'path' must not be empty"):
         load(tmp_path, with_metrics('sink = "csv"\npath = " "'))
+
+
+# --- the neural producer (F3-W2)
+
+NEURAL_TOML = """
+[neural]
+seed = 77
+
+[neural.buffer]
+moneyness_edges = [-0.4, -0.1, 0.1, 0.4]
+tenor_edges = [0.02, 0.1, 0.5]
+capacity_per_cell = 16
+max_age_seconds = 900.0
+
+[neural.mesh]
+k_min = -0.5
+k_max = 0.5
+n_nodes = 11
+tenors = [0.08, 0.25]
+
+[neural.gate]
+butterfly = 0.001
+calendar = 0.0002
+
+[neural.schedule]
+replay_size = 32
+restart_seconds = 1800.0
+"""
+"""A complete ``[neural]`` with no optional sub-table, so it is read on every installation."""
+
+NETWORK_TOML = """
+[neural.network]
+hidden = [8, 8, 8]
+activation = "softplus"
+k_scale = 0.25
+tenor_scale = 2.0
+"""
+"""Every value differs from ``NetworkSpec``'s own default."""
+
+TORCH_FIT_TOML = """
+[neural.fit]
+cold_steps = 123
+warm_steps = 7
+cold_learning_rate = 0.02
+warm_learning_rate = 0.002
+butterfly_penalty = 50.0
+calendar_penalty = 60.0
+init_seed = 9
+"""
+"""Every value differs from ``TorchFitSettings``'s own default."""
+
+HAS_TORCH_EXTRA = find_spec("torch") is not None
+
+needs_torch = pytest.mark.skipif(not HAS_TORCH_EXTRA, reason="needs the neural extra")
+
+
+def test_a_file_with_no_neural_table_leaves_the_producer_unconfigured(tmp_path: Path) -> None:
+    assert load(tmp_path).neural is None
+
+
+def test_the_neural_table_fills_the_types_neural_surface_owns(tmp_path: Path) -> None:
+    """No mirror type: the buffer, the gate and the schedule are the context's own objects."""
+    neural = load(tmp_path, CONFIG_TOML + NEURAL_TOML).neural
+
+    assert neural is not None
+    assert neural.buffer == StratificationSpec(
+        moneyness_edges=(-0.4, -0.1, 0.1, 0.4),
+        tenor_edges=(0.02, 0.1, 0.5),
+        capacity_per_cell=16,
+        max_age_seconds=900.0,
+    )
+    assert neural.gate == GateThresholds(butterfly=0.001, calendar=0.0002)
+    assert neural.schedule == TrainingSchedule(replay_size=32, restart_seconds=1800.0)
+    assert neural.seed == 77
+
+
+def test_the_mesh_is_built_uniform_from_a_range_and_a_count(tmp_path: Path) -> None:
+    """The one table spelled differently from its type: the axis lands exactly on its ends."""
+    neural = load(tmp_path, CONFIG_TOML + NEURAL_TOML).neural
+
+    assert neural is not None
+    assert neural.mesh.log_moneyness[0] == -0.5
+    assert neural.mesh.log_moneyness[-1] == 0.5
+    assert len(neural.mesh.log_moneyness) == 11
+    assert neural.mesh.log_moneyness[5] == pytest.approx(0.0, abs=1e-15)
+    assert neural.mesh.tenors == (0.08, 0.25)
+
+
+def test_an_absent_restart_interval_means_never(tmp_path: Path) -> None:
+    neural = load(tmp_path, without(CONFIG_TOML + NEURAL_TOML, "restart_seconds")).neural
+
+    assert neural is not None
+    assert neural.schedule.restart_seconds is None
+
+
+def test_a_neural_table_without_its_optional_tables_leaves_the_learner_defaults(
+    tmp_path: Path,
+) -> None:
+    neural = load(tmp_path, CONFIG_TOML + NEURAL_TOML).neural
+
+    assert neural is not None
+    assert neural.network is None
+    assert neural.fit is None
+
+
+def test_a_neural_table_without_optional_tables_is_read_without_the_extra(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The extra is asked for by the two tables whose types live beside torch, not by ``[neural]``.
+
+    Which is what lets a file carry the neural producer's configuration and still run its
+    parametric producers under ``--calibrators`` on an installation without torch.
+    """
+    hide(monkeypatch, "torch")
+
+    assert load(tmp_path, CONFIG_TOML + NEURAL_TOML).neural is not None
+
+
+@pytest.mark.parametrize(
+    ("table", "name"), [(NETWORK_TOML, r"neural\.network"), (TORCH_FIT_TOML, r"neural\.fit")]
+)
+def test_a_torch_table_without_the_extra_is_refused_with_the_remedy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, table: str, name: str
+) -> None:
+    hide(monkeypatch, "torch")
+
+    with pytest.raises(ConfigError, match=rf"{name}: .*uv sync --extra neural"):
+        load(tmp_path, CONFIG_TOML + NEURAL_TOML + table)
+
+
+@needs_torch
+def test_the_network_table_fills_the_learner_own_type(tmp_path: Path) -> None:
+    torch_learner = pytest.importorskip("volengine.neural_surface.adapters.torch_learner")
+
+    neural = load(tmp_path, CONFIG_TOML + NEURAL_TOML + NETWORK_TOML).neural
+
+    assert neural is not None
+    assert neural.network is not None
+    assert neural.network == torch_learner.NetworkSpec(
+        hidden=(8, 8, 8),
+        activation=torch_learner.Activation.SOFTPLUS,
+        k_scale=0.25,
+        tenor_scale=2.0,
+    )
+    assert isinstance(neural.network.activation, torch_learner.Activation)
+
+
+@needs_torch
+def test_the_fit_table_fills_the_learner_own_type(tmp_path: Path) -> None:
+    torch_learner = pytest.importorskip("volengine.neural_surface.adapters.torch_learner")
+
+    neural = load(tmp_path, CONFIG_TOML + NEURAL_TOML + TORCH_FIT_TOML).neural
+
+    assert neural is not None
+    assert neural.fit == torch_learner.TorchFitSettings(
+        cold_steps=123,
+        warm_steps=7,
+        cold_learning_rate=0.02,
+        warm_learning_rate=0.002,
+        butterfly_penalty=50.0,
+        calendar_penalty=60.0,
+        init_seed=9,
+    )
+
+
+@needs_torch
+def test_a_missing_key_in_the_fit_table_names_the_table(tmp_path: Path) -> None:
+    """Complete when present, like every adapter table."""
+    with pytest.raises(ConfigError, match=r"neural\.fit: the key 'warm_steps'"):
+        load(tmp_path, without(CONFIG_TOML + NEURAL_TOML + TORCH_FIT_TOML, "warm_steps"))
+
+
+@needs_torch
+def test_an_activation_the_learner_does_not_offer_lists_the_ones_it_does(tmp_path: Path) -> None:
+    text = replacing(CONFIG_TOML + NEURAL_TOML + NETWORK_TOML, "activation", 'activation = "relu"')
+
+    with pytest.raises(ConfigError, match="tanh, softplus"):
+        load(tmp_path, text)
+
+
+def test_a_missing_neural_sub_table_names_it(tmp_path: Path) -> None:
+    text = (CONFIG_TOML + NEURAL_TOML).replace("[neural.gate]\nbutterfly = 0.001\n", "")
+    text = text.replace("calendar = 0.0002\n", "")
+
+    with pytest.raises(ConfigError, match="neural: the key 'gate' is missing"):
+        load(tmp_path, text)
+
+
+def test_a_missing_seed_is_refused(tmp_path: Path) -> None:
+    """No default: the seed is what makes a replay of the draw reproducible (ADR-004)."""
+    with pytest.raises(ConfigError, match="neural: the key 'seed'"):
+        load(tmp_path, without(CONFIG_TOML + NEURAL_TOML, "seed"))
+
+
+def test_a_gate_tolerance_the_use_case_refuses_is_blamed_on_its_table(tmp_path: Path) -> None:
+    text = replacing(CONFIG_TOML + NEURAL_TOML, "butterfly", "butterfly = -1.0")
+
+    with pytest.raises(ConfigError, match=r"neural\.gate: The butterfly tolerance"):
+        load(tmp_path, text)
+
+
+def test_a_buffer_the_domain_refuses_is_blamed_on_its_table(tmp_path: Path) -> None:
+    text = replacing(CONFIG_TOML + NEURAL_TOML, "capacity_per_cell", "capacity_per_cell = 0")
+
+    with pytest.raises(ConfigError, match=r"neural\.buffer: The capacity per cell"):
+        load(tmp_path, text)
+
+
+def test_a_mesh_too_coarse_to_judge_is_blamed_on_its_table(tmp_path: Path) -> None:
+    """Two nodes span no interior point; the refusal is ``ArbitrageMesh``'s, named by the table.
+
+    ``n_nodes`` appears in ``[calibration.grid]`` too, so the replacement is spelled on the mesh's
+    own neighbourhood rather than by key.
+    """
+    text = (CONFIG_TOML + NEURAL_TOML).replace(
+        "k_max = 0.5\nn_nodes = 11", "k_max = 0.5\nn_nodes = 2"
+    )
+
+    with pytest.raises(ConfigError, match=r"neural\.mesh: The moneyness mesh"):
+        load(tmp_path, text)
+
+
+def test_a_single_node_mesh_is_refused_before_it_divides_by_zero(tmp_path: Path) -> None:
+    text = (CONFIG_TOML + NEURAL_TOML).replace(
+        "k_max = 0.5\nn_nodes = 11", "k_max = 0.5\nn_nodes = 1"
+    )
+
+    with pytest.raises(ConfigError, match=r"neural\.mesh: 'n_nodes' must be at least 2"):
+        load(tmp_path, text)
+
+
+def test_a_boolean_among_the_mesh_tenors_is_refused(tmp_path: Path) -> None:
+    """``isinstance(True, int)`` is true; a ``true`` in an array must not become a tenor of 1.0."""
+    text = replacing(CONFIG_TOML + NEURAL_TOML, "tenors", "tenors = [0.08, true]")
+
+    with pytest.raises(ConfigError, match=r"neural\.mesh: 'tenors' must be a number"):
+        load(tmp_path, text)
+
+
+@needs_torch
+def test_a_boolean_among_the_hidden_widths_is_refused(tmp_path: Path) -> None:
+    text = replacing(CONFIG_TOML + NEURAL_TOML + NETWORK_TOML, "hidden", "hidden = [8, true]")
+
+    with pytest.raises(ConfigError, match=r"neural\.network: 'hidden' must be an array of int"):
+        load(tmp_path, text)

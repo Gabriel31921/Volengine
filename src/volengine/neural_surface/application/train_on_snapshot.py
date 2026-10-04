@@ -42,7 +42,11 @@ from volengine.neural_surface.application.acl import (
 )
 from volengine.neural_surface.application.grid_spec import GridSpec
 from volengine.neural_surface.application.training_state import TrainingState
-from volengine.neural_surface.domain.errors import EmptyBufferError, NeuralSurfaceError
+from volengine.neural_surface.domain.errors import (
+    EmptyBufferError,
+    NeuralSurfaceError,
+    SurfaceEvaluationError,
+)
 from volengine.neural_surface.domain.invariants import ArbitrageMesh, check_surface
 from volengine.neural_surface.domain.learned_surface import LearnedSurface, implied_vol_grid
 from volengine.neural_surface.domain.ports import Clock, MetricsSink, SurfaceLearner
@@ -226,6 +230,13 @@ class TrainOnSnapshot:
            fine-tuning had arrived at and the one retrained from scratch (Design 6.4).
         7. **Publish**, or refuse and republish the last good surface (ADR-006).
 
+        **A diverged network is refused like any other failure** (F3-W2). ``check_surface`` and
+        ``to_calibrated_surface`` both raise ``SurfaceEvaluationError`` on a surface that answers
+        with NaN, the wrong shape or a non-positive variance, and both are answered here with the
+        same ``CalibrationFailed`` and ADR-006 republish as a refused gate -- never left to escape
+        ``handle``, where the runner would count it and swallow it and the producer would fall
+        silent with nothing on its failure topic. See :meth:`_diverged` for what is kept.
+
         Returns:
             The events, in the order they should be published: one ``SurfaceCalibrated``, or a
             ``CalibrationFailed`` followed by the republished surface when there is one to fall
@@ -268,7 +279,13 @@ class TrainOnSnapshot:
             return self._refuse(snapshot, str(failure))
         finished = self._clock.now()
 
-        report = check_surface(surface, self._mesh)
+        try:
+            report = check_surface(surface, self._mesh)
+        except SurfaceEvaluationError as failure:
+            # Before `trained()` and `restarted()`, deliberately: neither the surface nor the
+            # restart is recorded, so the next cycle continues from the last evaluable surface and
+            # a restart that diverged is still due. See `_diverged`.
+            return self._diverged(snapshot, failure)
         self._metrics.gauge(
             "neural.butterfly_violation", report.butterfly_violation, market=snapshot.market_id
         )
@@ -298,26 +315,34 @@ class TrainOnSnapshot:
         if report.exceeds(self._thresholds.butterfly, self._thresholds.calendar):
             return self._refuse(snapshot, "the surface failed the no-arbitrage gate")
 
-        published = to_calibrated_surface(
-            surface=surface,
-            snapshot=snapshot,
-            grid=self._grid,
-            producer_id=self._learner.producer_id,
-            surface_id=self._surface_id(snapshot),
-            ts_calibrated=finished,
-            status=(SurfaceStatus.DEGRADED if snapshot.quality.degraded else SurfaceStatus.OK),
-            fit=fit_metrics(
+        try:
+            published = to_calibrated_surface(
                 surface=surface,
-                # On a restart there are no fresh points to measure against, so the residual is
-                # taken over the whole batch instead. It is a different question -- "does the model
-                # fit its own history" rather than "does it fit the market now" -- and reporting it
-                # under the same field is the honest option only because the alternative is
-                # publishing a surface with no fit metrics at all, which the contract forbids.
-                fresh=batch.fresh if batch.n_fresh else batch.samples,
-                n_iterations=1,
-                duration_ms=(finished - started).total_seconds() * MILLISECONDS_PER_SECOND,
-            ),
-        )
+                snapshot=snapshot,
+                grid=self._grid,
+                producer_id=self._learner.producer_id,
+                surface_id=self._surface_id(snapshot),
+                ts_calibrated=finished,
+                status=(SurfaceStatus.DEGRADED if snapshot.quality.degraded else SurfaceStatus.OK),
+                fit=fit_metrics(
+                    surface=surface,
+                    # On a restart there are no fresh points to measure against, so the residual
+                    # is taken over the whole batch instead. It is a different question -- "does
+                    # the model fit its own history" rather than "does it fit the market now" --
+                    # and reporting it under the same field is the honest option only because the
+                    # alternative is publishing a surface with no fit metrics at all, which the
+                    # contract forbids.
+                    fresh=batch.fresh if batch.n_fresh else batch.samples,
+                    n_iterations=1,
+                    duration_ms=(finished - started).total_seconds() * MILLISECONDS_PER_SECOND,
+                ),
+            )
+        except SurfaceEvaluationError as failure:
+            # Evaluable on the gate's mesh and not at the snapshot's own tenors or quotes: the
+            # network answers where it was judged and not where it would be published. The
+            # surface has already been kept as the training state -- it passed the one judgement
+            # that decides that -- and only its publication is refused.
+            return self._diverged(snapshot, failure)
         if published is None:
             return self._refuse(snapshot, "the snapshot carried no tenor to publish on")
 
@@ -378,6 +403,32 @@ class TrainOnSnapshot:
         give their surfaces one identity.
         """
         return f"{snapshot.snapshot_id}/{self._learner.producer_id}"
+
+    def _diverged(
+        self, snapshot: MarketSnapshot, failure: SurfaceEvaluationError
+    ) -> tuple[Event, ...]:
+        """Refuse a surface that is not a surface, and count it apart from the gate's refusals.
+
+        The F3-D debt row, paid: a diverged network is the learner's principal failure path, and
+        it is answered with the same pair as every other refusal -- ``CalibrationFailed``, then
+        the last good surface republished (ADR-006) -- so a consumer sees one channel for both
+        engines. ``neural.surface.diverged`` is counted beside ``neural.publication.refused``
+        because the two mean different things to an operator: a refused gate is the quality
+        signal of ADR-010, a diverged network is the model breaking.
+
+        **What is not kept, when it comes from the gate's check.** The diverged surface does not
+        become the training state, because every later warm start would continue from its NaN
+        weights and diverge again -- a producer refusing forever on the first bad step. The state
+        stays at the last evaluable surface, and the next snapshot fine-tunes from there. A
+        restart that diverges is likewise not recorded, so it is still due on the next cycle
+        (``TrainingState.restarted`` says why asking and doing are two events).
+        """
+        self._metrics.counter(
+            "neural.surface.diverged",
+            market=snapshot.market_id,
+            producer=self._learner.producer_id,
+        )
+        return self._refuse(snapshot, f"the network diverged: {failure}")
 
     def _refuse(self, snapshot: MarketSnapshot, reason: str) -> tuple[Event, ...]:
         """Publish the failure, and the previous surface behind it if there is one (ADR-006)."""

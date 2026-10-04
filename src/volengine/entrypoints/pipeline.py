@@ -34,17 +34,18 @@ the engine be ignorant of the wiring.
 
 **Adapters arrive by name.** :func:`default_adapters` is the registry that maps a configured
 string -- ``provider = "constant"`` -- onto the callable that builds the object, and it is the
-only place in the engine that *constructs* one. It holds eight: the walking skeleton's three,
-F2's three beside them, since F3-C the live venue, and since F3-W1 the JAX calibrator, so a file
-may name a constant feed, a synthetic one or Deribit, a mean or one of two fits, a console or a
-file. A name it does not hold fails here with a message that says which one was not registered.
-Passing the registry into :func:`build_pipeline` rather than reaching for it keeps the graph
-testable with fakes.
+only place in the engine that *constructs* one. It holds nine: the walking skeleton's three,
+F2's three beside them, since F3-C the live venue, since F3-W1 the JAX calibrator and since F3-W2
+the torch learner, so a file may name a constant feed, a synthetic one or Deribit, a mean, one of
+two fits or a network, a console or a file. A name it does not hold fails here with a message that
+says which one was not registered. Passing the registry into :func:`build_pipeline` rather than
+reaching for it keeps the graph testable with fakes.
 
-**Two of the eight need an optional extra, and both are imported lazily** -- the Deribit feed's
-transport inside its adapter, the JAX calibrator's whole module inside its factory -- so that this
-module, and the CLI with it, import on an installation without either. Their factories are where a
-missing extra is noticed: at wiring time, with the command that installs it in the message.
+**Three of the nine need an optional extra, and all three are imported lazily** -- the Deribit
+feed's transport inside its adapter, the JAX calibrator's and the torch learner's whole modules
+inside their factories -- so that this module, and the CLI with it, import on an installation
+without any of them. Their factories are where a missing extra is noticed: at wiring time, with the
+command that installs it in the message.
 
 **Recording and replay are modes of a run, not entries in that registry** (ADR-004).
 :func:`with_recording` decorates every provider with a tap onto a file; :func:`with_replay`
@@ -60,24 +61,25 @@ deployment retunes (ADR-012) and mirroring them in the loader would be a second 
 guards. So the claim above is about construction, not about imports -- what neither module allows
 is a *configuration file* naming a class.
 
-**Three of the four contexts are wired here, and Neural Surface is not.** The graph is Market
-Data to Parametric Pricing to Risk; ``TrainOnSnapshot`` has no place in it and ``AppConfig`` has
-no section that would feed one. That is a gap rather than an omission, and it is in
-``docs/SEAMS.md``: the learner behind that use case is torch, an optional extra that arrives in
-F3-C, and wiring it needs a replay buffer, an arbitrage mesh, gate thresholds, a restart schedule
-and a seeded generator -- five configuration sections whose values nothing in this build could
-exercise or check. Adding them now would be five thresholds chosen by guesswork, which is the
-opposite of what ADR-012 asks configuration to be. The shape it will take is settled: a second
-producer kind alongside :data:`CalibratorFactory`, publishing the same ``CalibratedSurface`` onto
-the same topic, which is the arrangement Design 6.5 and 7.3 exist to compare.
+**All four contexts are wired here since F3-W2, and the two engines are one kind of producer.**
+A producer is anything with ``handle(snapshot) -> tuple[Event, ...]`` (ADR-016):
+``CalibrateOnSnapshot`` for a :data:`CalibratorFactory`, ``TrainOnSnapshot`` for a
+:data:`LearnerFactory`. :class:`SnapshotHandler` names that shape here, in the composition root,
+rather than as a protocol in either context -- neither context may know the other exists (rule 6),
+and the generalisation is a fact about the wiring, not about either use case. Both publish the
+same ``CalibratedSurface`` onto the same topic spelling, so Risk caches, reports on and compares
+the network exactly as it does a fit (Design 6.5, 7.3); nothing downstream learns which engine a
+surface came from except through ``producer_id``. A producer name is looked up among the
+calibrators and the learners together, and ``calibration.calibrators`` lists both kinds.
 
 **Everything except the calibrations runs on the event loop**, single-threaded, and that is a
-choice rather than an oversight. ``QuoteChain``, ``CalibrationState`` and
-``LastValueSurfaceProvider`` are all documented as not thread-safe; the calibrations are the only
-work long enough to be worth an executor, each market gets its own ``CalibrateOnSnapshot`` and
-``CalibrationState`` per producer, and the pool has one worker, so each of those states is touched
-by one thread at a time. The results are published back on the loop -- never from the worker --
-because ``InProcessConflatingBus`` drives an ``asyncio.Event`` and is not thread-safe either.
+choice rather than an oversight. ``QuoteChain``, ``CalibrationState``, ``TrainingState``,
+``ReplayBuffer`` and ``LastValueSurfaceProvider`` are all documented as not thread-safe; the
+calibrations and the training steps are the only work long enough to be worth an executor, each
+market gets its own use case and state per producer, and the pool has one worker, so each of those
+states is touched by one thread at a time. The results are published back on the loop -- never
+from the worker -- because ``InProcessConflatingBus`` drives an ``asyncio.Event`` and is not
+thread-safe either.
 
 **Several markets are several loops, and nothing downstream is told** (Design 4.7). Each configured
 market gets its own ``QuoteChain``, snapshot policy, ingestion task, heartbeat and rediscovery
@@ -92,9 +94,12 @@ from __future__ import annotations
 import asyncio
 import math
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from importlib.util import find_spec
 from pathlib import Path
+from typing import Protocol
+
+import numpy as np
 
 from volengine.contracts.events import (
     CalibrationFailed,
@@ -103,16 +108,20 @@ from volengine.contracts.events import (
     SnapshotReady,
     SurfaceCalibrated,
 )
+from volengine.contracts.market_snapshot import MarketSnapshot
 from volengine.entrypoints.config import (
     DERIBIT_PROVIDER,
     JAX_CALIBRATOR,
     SYNTHETIC_PROVIDER,
+    TORCH_LEARNER,
     AppConfig,
     CalibrationConfig,
     ConfigError,
     MarketConfig,
+    NeuralConfig,
     RiskConfig,
     require_jax_extra,
+    require_torch_extra,
 )
 from volengine.market_data.adapters.constant import ConstantProvider
 from volengine.market_data.adapters.deribit_ws import DeribitProvider
@@ -126,6 +135,12 @@ from volengine.market_data.domain.errors import MarketDataError
 from volengine.market_data.domain.ports import MarketDataProvider
 from volengine.market_data.domain.quote_chain import QuoteChain
 from volengine.market_data.domain.snapshot_policy import SnapshotPolicy
+from volengine.neural_surface.application.acl import Weighting as NeuralWeighting
+from volengine.neural_surface.application.grid_spec import GridSpec as NeuralGridSpec
+from volengine.neural_surface.application.train_on_snapshot import TrainOnSnapshot
+from volengine.neural_surface.application.training_state import TrainingState
+from volengine.neural_surface.domain.ports import SurfaceLearner
+from volengine.neural_surface.domain.replay_buffer import ReplayBuffer
 from volengine.parametric_pricing.adapters.flat_vol import PRODUCER_ID as FLAT_VOL_ID
 from volengine.parametric_pricing.adapters.flat_vol import FlatVolCalibrator
 from volengine.parametric_pricing.adapters.scipy_calibrator import PRODUCER_ID as SCIPY_ID
@@ -153,8 +168,24 @@ type CalibratorFactory = Callable[[CalibrationConfig], Calibrator]
 """Builds one producer. It names itself through ``Calibrator.producer_id``, which is why the
 factory is keyed by the configured string and the *identity* still comes from the object."""
 
+type LearnerFactory = Callable[[NeuralConfig], SurfaceLearner]
+"""Builds one neural producer from ``[neural]``. Named by ``SurfaceLearner.producer_id``, on the
+same terms as :data:`CalibratorFactory`."""
+
 type WriterFactory = Callable[[RiskConfig], ReportWriter]
 """Builds the destination a finished report goes to."""
+
+
+class SnapshotHandler(Protocol):
+    """What a producer is, as far as the composition root cares: a snapshot in, events out.
+
+    ``CalibrateOnSnapshot`` and ``TrainOnSnapshot`` both satisfy it structurally (ADR-016), and
+    neither imports it. Declared here because this is the only module that holds both: a protocol
+    in either context would be one context describing the other's use case.
+    """
+
+    def handle(self, snapshot: MarketSnapshot) -> tuple[Event, ...]: ...
+
 
 SETTLE_HOPS = 3
 """Loop iterations a settling pass yields before it decides nothing more is pending.
@@ -183,11 +214,15 @@ class Adapters:
     providers: Mapping[str, ProviderFactory]
     calibrators: Mapping[str, CalibratorFactory]
     writers: Mapping[str, WriterFactory]
+    learners: Mapping[str, LearnerFactory] = field(default_factory=dict)
+    """The neural producers (F3-W2). Empty by default, so a registry of fakes built for a test
+    about parametric producers does not have to say it has no network -- the default is the truth
+    for every such registry, and :func:`default_adapters` states the real one."""
 
 
 def default_adapters() -> Adapters:
-    """Every concrete adapter this build knows how to make: three feeds, three producers, two
-    writers.
+    """Every concrete adapter this build knows how to make: three feeds, four producers -- three
+    calibrators and a learner -- and two writers.
 
     **The only function in the engine that constructs an adapter**, which is what keeps every
     other module -- and every configuration file -- ignorant of infrastructure. A name it does not
@@ -200,9 +235,9 @@ def default_adapters() -> Adapters:
     threshold that ADR-012 already put somewhere else, and no factory reaches past its own section
     to find one.
 
-    Three of the eight take no settings at all, and that is a property of those adapters rather
+    Three of the nine take no settings at all, and that is a property of those adapters rather
     than an oversight: a constant feed, a weighted mean and a console have nothing a deployment
-    could retune. The other five read the sections F2-07, F3-C and F3-W1 gave them.
+    could retune. The other six read the sections F2-07, F3-C, F3-W1 and F3-W2 gave them.
     """
     return Adapters(
         providers={
@@ -223,6 +258,7 @@ def default_adapters() -> Adapters:
             "console": lambda _risk: ConsoleReportWriter(),
             "csv": _csv_report_writer,
         },
+        learners={TORCH_LEARNER: _torch_learner},
     )
 
 
@@ -285,6 +321,23 @@ def _jax_calibrator(calibration: CalibrationConfig) -> Calibrator:
     from volengine.parametric_pricing.adapters.jax_calibrator import JaxCalibrator
 
     return JaxCalibrator(calibration.jax)
+
+
+def _torch_learner(neural: NeuralConfig) -> SurfaceLearner:
+    """The torch learner, trained against the gate's own mesh and on ``[neural]``'s tuning.
+
+    :func:`_jax_calibrator`'s shape: the extra is checked, then the module that imports ``torch``
+    at its top is imported here and nowhere earlier. ``network`` and ``fit`` are ``None`` unless
+    the file states ``[neural.network]`` and ``[neural.fit]``, and the learner answers that with the
+    defaults it ships with and argues for.
+
+    The penalty mesh is ``neural.mesh``, the mesh the gate judges on -- see ``NeuralConfig.mesh``
+    for why one mesh serves both.
+    """
+    require_torch_extra(f"calibrator {TORCH_LEARNER!r}")
+    from volengine.neural_surface.adapters.torch_learner import TorchLearner
+
+    return TorchLearner(penalty_mesh=neural.mesh, settings=neural.fit, spec=neural.network)
 
 
 def _csv_report_writer(risk: RiskConfig) -> ReportWriter:
@@ -466,11 +519,15 @@ class _MarketLoop:
 
 @dataclass(frozen=True, slots=True)
 class _Producer:
-    """One calibrator on one market, and the risk report computed off what it publishes."""
+    """One producer on one market, and the risk report computed off what it publishes.
+
+    ``handler`` is a ``CalibrateOnSnapshot`` or a ``TrainOnSnapshot``; nothing below this point
+    asks which (:class:`SnapshotHandler`).
+    """
 
     market_id: str
     producer_id: str
-    calibrate: CalibrateOnSnapshot
+    handler: SnapshotHandler
     report: ComputeReportUseCase
     snapshots: Subscription
     surfaces: Subscription
@@ -527,7 +584,8 @@ def build_pipeline(
             is registered for. A start-up failure by design: the alternative is an engine that
             runs with a context missing and publishes nothing, which looks exactly like a market
             that is not moving. Also if the book and the markets do not line up -- see
-            :func:`_book_for`.
+            :func:`_book_for` -- and if a neural producer is listed without a ``[neural]`` table to
+            build it from.
     """
     executors = NamedExecutors()
     cache = LastValueSurfaceProvider(clock=clock, metrics=metrics)
@@ -570,21 +628,12 @@ def build_pipeline(
         )
 
         for name in config.calibration.calibrators:
-            calibrator = _lookup(adapters.calibrators, name, "calibrator")(config.calibration)
-            producer_id = calibrator.producer_id
+            producer_id, handler = _producer_for(name, config, adapters, clock, metrics)
             producers.append(
                 _Producer(
                     market_id=market.market_id,
                     producer_id=producer_id,
-                    calibrate=CalibrateOnSnapshot(
-                        calibrator=calibrator,
-                        state=CalibrationState(),
-                        clock=clock,
-                        metrics=metrics,
-                        weighting=config.calibration.weighting,
-                        grid=config.calibration.grid,
-                        acceptance=config.calibration.acceptance,
-                    ),
+                    handler=handler,
                     report=ComputeReportUseCase(
                         provider=ProducerSurfaces(cache, producer_id),
                         portfolio=book,
@@ -618,6 +667,76 @@ def build_pipeline(
         cache=cache,
         writer=writer,
         executors=executors,
+    )
+
+
+def _producer_for(
+    name: str,
+    config: AppConfig,
+    adapters: Adapters,
+    clock: Clock,
+    metrics: MetricsSink,
+) -> tuple[str, SnapshotHandler]:
+    """Build one producer on one market: a calibration use case or a training one, by registry.
+
+    Called once per market per name, so every market gets its own calibration or training state
+    -- and, for a learner, its own replay buffer and its own generator -- exactly as Design 4.7
+    asks of per-market state.
+
+    **The learner's mesh and weights are the calibrators'.** ``[calibration.grid]`` and
+    ``[calibration.weighting]`` are translated here into Neural Surface's own twins of those types
+    (rule 6 keeps the contexts from sharing one), field by field, so the two engines publish on
+    the same nodes and weigh each quote alike -- the constants Design 6.5 holds while the models
+    vary. The generator is seeded per market from ``[neural].seed``, so a market's draws do not
+    depend on how many markets came before it in the file.
+
+    Raises:
+        ConfigError: If the name is registered nowhere, or in both registries -- one name meaning
+            two producers would be decided by the order of two lookups -- or if it is a learner
+            and the file has no ``[neural]`` table.
+    """
+    in_calibrators = name in adapters.calibrators
+    in_learners = name in adapters.learners
+    if in_calibrators and in_learners:
+        raise ConfigError(f"the producer {name!r} is registered both as a calibrator and a learner")
+    if in_learners:
+        neural = config.neural
+        if neural is None:
+            raise ConfigError(
+                f"calibration: the producer {name!r} is a learner and needs a [neural] table "
+                "describing its replay buffer, mesh, gate, schedule and seed"
+            )
+        learner = adapters.learners[name](neural)
+        grid, weighting = config.calibration.grid, config.calibration.weighting
+        return learner.producer_id, TrainOnSnapshot(
+            learner=learner,
+            state=TrainingState(),
+            buffer=ReplayBuffer(neural.buffer),
+            clock=clock,
+            metrics=metrics,
+            weighting=NeuralWeighting(
+                spread_scale=weighting.spread_scale,
+                flagged_factor=weighting.flagged_factor,
+                unpaired_itm_factor=weighting.unpaired_itm_factor,
+            ),
+            grid=NeuralGridSpec(k_min=grid.k_min, k_max=grid.k_max, n_nodes=grid.n_nodes),
+            mesh=neural.mesh,
+            thresholds=neural.gate,
+            schedule=neural.schedule,
+            rng=np.random.default_rng(neural.seed),
+        )
+    if not in_calibrators:
+        known = ", ".join(sorted({*adapters.calibrators, *adapters.learners})) or "nothing"
+        raise ConfigError(f"no calibrator adapter is registered under {name!r}; known: {known}")
+    calibrator = adapters.calibrators[name](config.calibration)
+    return calibrator.producer_id, CalibrateOnSnapshot(
+        calibrator=calibrator,
+        state=CalibrationState(),
+        clock=clock,
+        metrics=metrics,
+        weighting=config.calibration.weighting,
+        grid=config.calibration.grid,
+        acceptance=config.calibration.acceptance,
     )
 
 
@@ -1031,7 +1150,7 @@ class Pipeline:
             loop = asyncio.get_running_loop()
             produced = await loop.run_in_executor(
                 self._executors.for_producer(producer.producer_id),
-                producer.calibrate.handle,
+                producer.handler.handle,
                 event.snapshot,
             )
             for outcome in produced:

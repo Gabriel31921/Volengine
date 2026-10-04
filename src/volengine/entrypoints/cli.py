@@ -83,10 +83,12 @@ MarketOption = Annotated[
 ]
 CalibratorsOption = Annotated[
     str | None,
-    # The example was `svi,neural` in Design 8.1 until the neural producer turned out not to be
-    # wired into the pipeline (docs/SEAMS.md): a help line promising a name the engine cannot
-    # build is worse than one that names what the shipped configurations actually list.
-    typer.Option("--calibrators", help="Comma-separated producers to run, e.g. svi-scipy,svi-jax."),
+    # Design 8.1's example is `svi,neural`; the help names what the shipped configurations list
+    # instead. Since F3-W2 the neural producer is one of them -- it is listed in
+    # `calibration.calibrators` beside the fits, so this flag narrows both kinds alike.
+    typer.Option(
+        "--calibrators", help="Comma-separated producers to run, e.g. svi-scipy,mlp-torch."
+    ),
 ]
 MetricsOption = Annotated[
     bool | None,

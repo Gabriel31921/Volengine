@@ -1,0 +1,264 @@
+# The two engines side by side on one market: the SVI fit and the neural network (F3-W2):
+#
+#     uv sync --extra neural
+#     uv run volengine run --config examples/svi-scipy-vs-mlp-torch.toml
+#     uv run volengine run --config examples/svi-scipy-vs-mlp-torch.toml --calibrators svi-scipy
+#
+# The first runs until the feed's twenty cycles end, about twenty seconds. The network's first
+# report arrives a few seconds after the fit's -- a cold start is two thousand Adam steps -- so a
+# `volengine report --count 4` over this file is answered by `svi-scipy` alone.
+#
+# The same invented market as `svi-scipy-vs-jax.toml`, published twice: by `svi-scipy`, which fits
+# five raw-SVI numbers per expiry, and by `mlp-torch`, which fits one small network over the whole
+# `(k, T)` plane, fine-tunes it a few steps per snapshot from a replay buffer, and is published only
+# through the hard no-arbitrage gate of ADR-010. The first producer listed is the baseline and the
+# second is measured against it, so every surface either of them publishes also produces the
+# `risk.comparison.*` series beside each producer's own `pricing.*` and `neural.*` measurements.
+#
+# Both producers share `[calibration.grid]` and `[calibration.weighting]`: the network publishes on
+# the same nodes and weighs every quote exactly as the fit does, which is what makes the distance
+# between the two surfaces a measure of the models (Design 6.5). The fit's acceptance RMSE does not
+# apply to the network -- its refusal rule is the gate in `[neural.gate]`.
+#
+# Every measurement lands in `metrics.csv` in the working directory (`[metrics]` at the bottom), one
+# row per measurement, appended to across runs; `--metrics` logs them instead.
+#
+# Without the `neural` extra a run naming `mlp-torch` is refused at start-up with the command that
+# installs it. This file states no `[neural.network]` or `[neural.fit]`, so it is still *read*
+# without the extra and `--calibrators svi-scipy` runs the baseline alone.
+
+[[market]]
+id = "BTC-SYNTH"
+underlying = "BTC"
+provider = "synthetic"
+# How far the venue's clock may sit from ours before its stamps are disbelieved (ADR-021). The
+# synthetic feed stamps `ts_exchange` about 8 ms before `ts_local`, so nothing here trips it --
+# the knob is exercised, not tested, by this file.
+max_skew_seconds = 30.0
+
+[market.conventions]
+day_count = "ACT/365F"
+expiry_time_utc = 08:00:00
+numeraire = "INVERSE"
+forward_method = "PROVIDER_UNDERLYING"
+
+[market.admissibility]
+# The quote-quality rules of Design 4.3, and the synthetic feed exists to make them fire: two per
+# cent of its quotes come out crossed, absurdly wide, one-sided, sizeless or an hour old. Ingestion
+# *flags*; the calibrator weights or excludes. Nothing here deletes a quote for being unfittable.
+max_spread_rel = 0.5
+max_age_seconds = 5.0
+moneyness_range = [-1.5, 1.5]
+max_iv_divergence_bp = 500.0
+convexity_tolerance = 0.0005
+min_size = 1.0
+
+[market.snapshot]
+cadence_seconds = 1.0
+# Twenty basis points, which is exactly the size of the forward's move between cycles: the filter
+# therefore has something real to have an opinion about instead of passing everything.
+material_move_threshold = 0.002
+# Two per cent of quotes are junk and about a fifth of those are one-sided, so a cycle covers
+# roughly ninety-nine per cent of the chain. Eighty is a floor that a genuinely broken cycle
+# breaches and a normal one does not.
+min_coverage_ratio = 0.8
+# The heartbeat: a market that goes quiet is still heard from once every cadence. This feed
+# publishes on a timer and never falls silent, so what the knob buys here is the demonstration.
+max_quiet_seconds = 5.0
+
+# --- the invented market, and the answer a fit is checked against
+#
+# Read by `SyntheticProvider` alone; a `[market.synthetic]` beside any other provider is refused
+# rather than ignored. Present, the table is complete -- there is no partial override, because a
+# loader that filled the gaps would be restating defaults the adapter already documents.
+
+[market.synthetic]
+forward0 = 60000.0
+strikes_per_expiry = 11
+# The strike ladder, as `ln(K / F)` against the *initial* forward and fixed for the run: a venue
+# lists absolute strikes and does not relist them when the underlying moves. Narrower than the
+# published grid below, so the wings a consumer prices against really are extrapolation.
+log_moneyness_range = [-0.25, 0.25]
+spread_bp = 200.0
+# Half a volatility point of noise on every quote. This is the number the recovery is stated
+# against, and the one a calibrator must never be tuned against.
+vol_noise_bp = 50.0
+size = 10.0
+junk_quote_rate = 0.02
+forward_move_rel = 0.002
+latency_seconds = 0.008
+jitter_seconds = 0.05
+# Finite, so `volengine run` over this file terminates on its own.
+cycles = 20
+interval_seconds = 1.0
+# The stream is a function of this seed and of `start`. `start` is deliberately absent, which
+# means "read the wall clock once": the expiries below are relative to it, so a pinned origin
+# would put this file's whole chain in the past within a day. Pin both to reproduce a session.
+seed = 20260827
+
+# One slice per expiry, in the order the chain is published. The five raw SVI parameters generate
+# `w(k) = a + b (rho (k - m) + sqrt((k - m)^2 + sigma^2))`, which is annualised by the tenor these
+# conventions imply and priced through Black-76. The three are ordered in total variance at every
+# moneyness, so the generated surface is free of calendar arbitrage as well as of butterfly
+# arbitrage -- a generator quietly producing an arbitrageable truth would make every acceptance
+# threshold downstream meaningless.
+[[market.synthetic.slice]]
+expiry_days = 30.0
+a = 0.020
+b = 0.050
+rho = -0.30
+m = 0.0
+sigma = 0.20
+
+[[market.synthetic.slice]]
+expiry_days = 90.0
+a = 0.055
+b = 0.090
+rho = -0.25
+m = 0.0
+sigma = 0.25
+
+[[market.synthetic.slice]]
+# A year, rather than the six months the adapter's own defaults stop at, so the position below
+# sits inside the grid rather than past the end of it -- see the note beside its expiry.
+expiry_days = 365.0
+a = 0.190
+b = 0.180
+rho = -0.15
+m = 0.0
+sigma = 0.35
+
+[calibration]
+# Baseline first: the order is what makes `mlp-torch` the challenger in the comparison. A learner
+# is listed here beside the calibrators, and `--calibrators` narrows both kinds alike.
+calibrators = ["svi-scipy", "mlp-torch"]
+
+[calibration.grid]
+# The published moneyness mesh (ADR-001). Wider than the quoted ladder, because a consumer asks
+# for wings nobody quoted; the arithmetic behind a node count is worked through in
+# `walking-skeleton.toml`, and it applies here with force, since `b` is no longer zero.
+k_min = -0.4
+k_max = 0.4
+n_nodes = 17
+
+[calibration.weighting]
+# What a quote counts for in the loss (ADR-018): tighter is heavier, a flagged quote keeps a
+# quarter of its weight, and an unpaired in-the-money one a tenth. Flagging and weighting are two
+# different jobs, done by two different contexts, and this is the second one.
+spread_scale = 0.05
+flagged_factor = 0.25
+unpaired_itm_factor = 0.1
+
+[calibration.acceptance]
+# The RMSE a slice must beat to be published rather than republished stale (ADR-006). The quotes
+# carry 50 bp of volatility noise by construction, so a fit that has recovered the surface still
+# shows an RMSE of that order and no threshold below it could ever be met. This is a few times the
+# noise: loose enough that a good fit goes out, tight enough that a collapsed one does not.
+max_rmse_vol_bp = 200.0
+
+[calibration.fit]
+# The scipy calibrator's tuning, as it ships (`FitSettings`). Read by `svi-scipy` alone.
+huber_scale_bp = 100.0
+durrleman_penalty_bp = 10000.0
+durrleman_mesh_nodes = 51
+durrleman_mesh_margin = 0.5
+min_quotes_for_free_shape = 5
+ridge_bp = 5.0
+max_nfev = 500
+
+# --- the neural producer (F3-W2)
+#
+# Everything `mlp-torch` needs beyond `[calibration]`. The four sub-tables and the seed are
+# required; `[neural.network]` and `[neural.fit]` are optional, complete when present, and absent
+# here, so the learner trains on the defaults `neural_surface/adapters/torch_learner.py` ships and
+# argues for (a 32x32 tanh network, 2000 annealed cold steps, 10 warm steps a snapshot).
+
+[neural]
+# Seeds the replay buffer's stratified draw, the one random step in the use case (ADR-004): two
+# replays of one recording train on the same history. The network's cold-start weights have a seed
+# of their own, `[neural.fit].init_seed`, inside the learner.
+seed = 20261004
+
+[neural.buffer]
+# How the `(k, T)` plane is cut into cells, each remembering at most `capacity_per_cell` points for
+# at most `max_age_seconds` (Design 6.4). The bands are finer near the money, where the quotes are,
+# and the outermost ones catch everything beyond them rather than dropping it. The tenor bands put
+# each of the three expiries below in a band of its own.
+moneyness_edges = [-0.5, -0.15, -0.05, 0.05, 0.15, 0.5]
+tenor_edges = [0.01, 0.15, 0.5, 2.0]
+capacity_per_cell = 64
+max_age_seconds = 600.0
+
+[neural.mesh]
+# Where the gate judges a surface, and where the network's soft no-arbitrage terms are trained: a
+# uniform log-moneyness axis -- written as a range and a node count, since it must be uniform to a
+# part in a billion -- crossed with the tenors listed. Wider than the published grid, because the
+# outermost two nodes are consumed by the central differences and never judged. The tenors span
+# the quoted expiries, a month to a year, and no further: measured on the golden fixture, a mesh
+# reaching past the tenors a market quotes trains the soft tier on extrapolation and the fit to
+# what *is* quoted gets worse (64 bp against 180 bp). The right tenors are a statement about a
+# market, and `[neural]` is one table for the engine -- `docs/SEAMS.md`, Entrypoints.
+k_min = -0.5
+k_max = 0.5
+n_nodes = 41
+tenors = [0.08, 0.25, 0.5, 1.0]
+
+[neural.gate]
+# How much arbitrage a surface may show and still be published (ADR-010); past either one it is
+# refused and the last good surface republished, as a refused fit is (ADR-006). Both in the units
+# the gate reports in -- the depth of Durrleman's function below zero, and a crossing in total
+# variance -- and both a ten-thousandth: the soft tier is a preference rather than a guarantee, and
+# a healthy network leaves breaches of order 1e-5 where the mesh extrapolates. Measured on this
+# mesh shape: none on this market in the runs behind this file; 6e-6 butterfly and 7e-5 calendar
+# on the golden fixture, where a butterfly line at exactly zero refused a 64 bp fit. A real breach
+# -- a smile that dips, an expiry carrying less variance than the one before it -- is orders of
+# magnitude past either line (`docs/SEAMS.md`).
+butterfly = 0.0001
+calendar = 0.0001
+
+[neural.schedule]
+# Each fine-tuning step replays this many buffered points beside the snapshot's own.
+replay_size = 64
+# A retrain from scratch over the whole buffer every ten seconds, which is far too often for a
+# live market and right for a twenty-second demonstration. The first snapshot of a session rests
+# on a handful of quotes; the cold start fits those, and ten warm steps a snapshot then move the
+# network only slowly towards the full chain -- measured on this market, 670 bp after the first
+# warm step and still 150 to 200 bp ten snapshots later. The restart retrains over everything the
+# buffer has gathered and lands near 45 bp, which is the noise the quotes carry. The cost is a
+# cold start -- a few seconds on one CPU -- on the learner's own thread, every interval. Absent
+# means never.
+restart_seconds = 10.0
+
+[risk]
+writer = "console"
+# `writer = "csv"` needs an `output_path` naming the file, and appends one row per valued
+# position to it. Uncomment both to get a file a spreadsheet or `pandas.read_csv` can read.
+# output_path = "reports.csv"
+
+[risk.freshness]
+warn_seconds = 30.0
+reject_seconds = 120.0
+
+[risk.report]
+discount = 1.0
+
+[risk.report.bumps]
+forward_rel = 0.01
+vol_abs = 0.01
+
+[[risk.position]]
+underlying = "BTC"
+# A fixed instant, because TOML has no way to say "ten months from now" -- so this date has to be
+# bumped once it passes, or the valuation refuses an expired position. It sits between the ninety-
+# day and the one-year slice above, so its volatility is interpolated along the tenor axis rather
+# than extrapolated past the end of the grid, and it stays that way until the date itself arrives.
+expiry = 2027-06-25T08:00:00Z
+strike = 60000.0
+kind = "CALL"
+quantity = 1.0
+
+[metrics]
+# `logging` and `null` are the other two sinks, and take no path. The file is appended to, never
+# truncated: delete it for a fresh one.
+sink = "csv"
+path = "metrics.csv"

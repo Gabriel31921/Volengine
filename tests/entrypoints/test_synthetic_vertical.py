@@ -25,6 +25,7 @@ from typer.testing import CliRunner
 
 from tests.entrypoints.builders import (
     RecordingWriter,
+    SteadyClock,
     make_app_config,
     make_calibration_config,
     make_market_config,
@@ -46,7 +47,6 @@ from volengine.market_data.adapters.synthetic import (
 )
 from volengine.parametric_pricing.adapters.scipy_calibrator import PRODUCER_ID
 from volengine.platform.bus import InProcessConflatingBus
-from volengine.platform.clock import SystemClock
 from volengine.platform.metrics import NullMetricsSink
 from volengine.risk.domain.freshness_policy import FreshnessDecision
 from volengine.risk.domain.portfolio import Position
@@ -164,10 +164,13 @@ async def test_the_report_carries_the_volatility_the_surface_was_generated_from(
     writer = RecordingWriter()
     config = vertical_config(start, quoted_expiry(vertical_config(start, start)))
 
+    # A steady clock rather than `SystemClock`: a host stepping its wall clock back during the
+    # session silences every snapshot after the first, and the last report then rests on a single
+    # quote (`SteadyClock` has the measurement).
     pipeline = build_pipeline(
         config,
         with_writer(writer),
-        SystemClock(),
+        SteadyClock(start),
         InProcessConflatingBus(NullMetricsSink()),
         NullMetricsSink(),
     )

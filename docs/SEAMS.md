@@ -144,24 +144,34 @@ close naturally in a later phase.
 - **`SurfaceLearner.update` returns a bare `LearnedSurface`** where `Calibrator.calibrate` returns a
   metrics-carrying `CalibrationResult` (ADR-019). The use case therefore recomputes the fresh-batch
   RMSE of §6.5 by re-evaluating the surface, and "these K steps diverged" has no channel short of
-  `SurfaceEvaluationError`.
+  `SurfaceEvaluationError` -- which `TrainOnSnapshot` answers, since F3-W2, with the same
+  `CalibrationFailed` and ADR-006 republish as a refused gate, counted apart as
+  `neural.surface.diverged`. A diverged surface caught by the gate's check is not kept as the
+  training state; one evaluable on the gate's mesh and not where it is published is kept, and only
+  its publication is refused.
 - **`implied_vol_grid` raises `SurfaceEvaluationError` when a legal but subnormal tenor overflows
   the division**, which blames the model for what is arguably the caller's axis.
-- **The torch learner has no TOML home and is not in `default_adapters`.** `TorchFitSettings`,
-  `NetworkSpec` and the penalty mesh are constructor arguments with working defaults, and
-  `mlp-torch` is reachable from Python and from the contract harness but not from a configuration
-  file -- the condition `svi-jax` was in from F3-A until F3-W1, for the same reason: F3-D stayed
-  inside the adapter module `Implementation.md` names for it. Wiring it is a larger change than
-  the JAX one, because the producer runs a different use case (`TrainOnSnapshot`, with a replay
-  buffer, a gate, a schedule and a seed of its own) and the composition root's `_Producer` holds a
-  `CalibrateOnSnapshot`; see the Entrypoints entry below.
+- **The neural producer has no RMSE acceptance, and a thin first snapshot costs it a restart.**
+  The parametric producer refuses a fit above `[calibration.acceptance]`; `TrainOnSnapshot` refuses
+  only on the arbitrage gate (ADR-010), so a network that fits badly but cleanly is published. The
+  case that makes it visible is the start of a session: the first snapshot can rest on a handful of
+  quotes, the cold start fits those, and ten warm steps a snapshot at the warm rate move the
+  network only slowly towards the full chain -- measured by F3-W2 on the synthetic market, 670 bp
+  after the first warm step and 150 to 200 bp ten snapshots later, against 45 bp once a scheduled
+  restart retrained over the buffer. `examples/svi-scipy-vs-mlp-torch.toml` restarts every ten
+  seconds for that reason, which no live deployment would. An acceptance rule for the network, or
+  a cold start deferred until the snapshot is not degraded, would change the use case.
 - **The soft tier is a preference and the tests say so with their tolerances.** On the synthetic
   chain -- whose total variance is *flat* across its two tenors, so any fitting noise is a
   crossing -- the shipped learner leaves a calendar excess of order `1e-5` in the extrapolated
   wings of the gate's mesh, and the session's small test network leaves `1e-4`. The tests gate at
   `1e-4` and call it `GENEROUS_GATE`. A gate at exactly zero would assert the guarantee ADR-010
-  says the soft tier does not give; what a deployment tolerates is the configuration the previous
-  item says does not exist yet.
+  says the soft tier does not give. What a deployment tolerates is `[neural.gate]` since F3-W2,
+  and the example states `1e-4` on both conditions: on the golden fixture the shipped learner left
+  a butterfly depth of `6e-6` and a calendar crossing of `7e-5` on that file's mesh shape -- a
+  butterfly line at zero refused a 64 bp fit, and the calendar margin is a factor of 1.4, which
+  `tests/entrypoints/test_neural_side_by_side.py` holds and a host training along another float
+  trajectory could cross.
 - **`TorchSurface.version` resets to `1` on every cold start**, where `LearnedSurface.version`'s
   docstring says "monotone counter". Both are true within a lineage and cannot both be true across
   a restart: `update(None, ...)` receives no history to continue the count from, and ADR-019 is
@@ -282,23 +292,10 @@ close naturally in a later phase.
   does mean the type grows by one optional field per configurable adapter — the alternative, a
   `Mapping[str, Any]` handed to the factory, was refused because it moves parsing into
   `*/adapters/` and takes the table name out of the message.
-- **Neural Surface is not wired into the pipeline.** `build_pipeline` runs Market Data to
-  Parametric Pricing to Risk; `TrainOnSnapshot` is built and tested, and since F3-D its learner
-  exists (`neural_surface/adapters/torch_learner.py`, exercised through the use case in
-  `tests/neural_surface/test_torch_learner.py`), but nothing constructs one in the composition
-  root and `AppConfig` has no section for the replay buffer, the arbitrage mesh, the gate
-  thresholds, the restart schedule, the learner's own settings or the seed it would need. F3-D
-  left it that way on purpose rather than by omission: the wiring is a composition-root change
-  (`_Producer` holds a `CalibrateOnSnapshot`, `Adapters` has no `learners` mapping, and a lazily
-  importing factory for an optional extra is the shape `svi-jax` took in F3-W1),
-  and the numbers those sections would carry are now measurable rather than guessed -- the
-  defaults in `TorchFitSettings` are argued against the synthetic chain -- but they have not yet
-  met the real recorded fixture. F3-W2 is the stage that wires it, on the lazily importing factory
-  F3-W1 gave `svi-jax`. F3-E's comparative report (`risk/application/compare_producers.py`)
-  already runs for any two configured parametric producers on a market (`svi-scipy` and `svi-jax`
-  in `examples/svi-scipy-vs-jax.toml`); wiring the neural one is what would make it compare the
-  two engines. `--calibrators` therefore still selects among parametric
-  producers only, which is why its help line does not repeat Design 8.1's `svi,neural` example.
+- **A file with `[neural.network]` or `[neural.fit]` needs the `neural` extra to be read at all**,
+  even under `--calibrators svi-scipy`: the two types live in the torch-importing adapter module,
+  so the loader cannot fill them without the extra -- the condition `[calibration.jax]` is in since
+  F3-W1, for the same reason. `[neural]` without those two sub-tables is read on any installation.
 - **The shipped examples' position expiries are fixed instants (2027-06-25) that will rot.**
   `examples/walking-skeleton.toml`, `examples/synthetic-svi.toml` and
   `examples/svi-scipy-vs-jax.toml` each carry one. TOML has no "N
@@ -309,11 +306,17 @@ close naturally in a later phase.
   and names registered adapters, never the date. Closing this for good means either a config field
   expressed as an offset from start-up (which the composition root would resolve against
   `SystemClock`) or accepting the periodic bump as the cost of a literal example file.
-- **`[calibration]` and `[risk]` are one table for the whole engine, not one per market.** Every
-  market is fitted with the same tuning, weights, grid and acceptance, and valued under the same
-  freshness policy. `examples/multi-market.toml` shows the cost: the synthetic market runs on the
-  venue's wider Huber scale and larger budget, which it does not need. Per-market calibration
-  state, grids and books are real (Design 4.7); per-market *thresholds* for them are not.
+- **`[calibration]`, `[neural]` and `[risk]` are one table for the whole engine, not one per
+  market.** Every market is fitted with the same tuning, weights, grid and acceptance, and valued
+  under the same freshness policy. `examples/multi-market.toml` shows the cost: the synthetic
+  market runs on the venue's wider Huber scale and larger budget, which it does not need. Per-market
+  calibration and training state, buffers, grids and books are real (Design 4.7); per-market
+  *thresholds* for them are not. `[neural.mesh]` makes the cost sharper than any threshold, because
+  its tenor axis is a statement about which expiries one market lists: F3-W2 measured the shipped
+  learner on the golden fixture at 64 bp with a mesh over the fixture's own tenors and 180 bp with
+  the synthetic example's month-to-a-year axis, which trains the soft tier on tenors nobody quoted.
+  The Deribit example therefore carries no `[neural]`, and the fixture replay in
+  `tests/entrypoints/test_neural_side_by_side.py` states its own mesh.
 ## Cross-cutting
 
 - **`_require_positive_finite` is written out in five domain modules.** The same argument as

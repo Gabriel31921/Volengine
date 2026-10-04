@@ -8,7 +8,7 @@ nothing goes out. Everything runs on a ``ManualClock`` and a seeded generator, s
 
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 
 import numpy as np
 import pytest
@@ -563,3 +563,126 @@ def test_an_empty_buffer_does_not_stop_the_first_snapshot_from_training() -> Non
 
     assert learner.calls[0][1].replayed == ()
     assert learner.calls[0][1].n_fresh > 0
+
+
+# --- a diverged network (F3-W2, the F3-D debt row)
+
+
+def diverged() -> CallableSurface:
+    """A network that has stopped describing a market: NaN everywhere it is asked.
+
+    What one bad gradient step leaves behind. ``nan < 0`` is ``False``, so if this reached the
+    gate's numbers it would score the cleanest report of the session; it must instead be refused
+    on the path every other failure takes.
+    """
+    return CallableSurface(fn=lambda k, t: np.full_like(k, np.nan))
+
+
+def test_a_diverged_surface_is_refused_rather_than_escaping_handle() -> None:
+    """Before F3-W2 the ``SurfaceEvaluationError`` left ``handle`` and the runner swallowed it."""
+    use_case, _, _, _, _ = make_use_case(learner=StubLearner(surface=diverged()))
+
+    events = use_case.handle(make_market_snapshot())
+
+    assert len(events) == 1
+    assert "diverged" in failures(events)[0].reason
+
+
+def test_a_diverged_surface_republishes_the_last_good_one() -> None:
+    """The refuse-and-republish pair of ADR-006, exactly as a refused gate produces it."""
+    learner = StubLearner()
+    use_case, _, _, _, _ = make_use_case(learner=learner)
+    good = surfaces(use_case.handle(make_market_snapshot()))[0].surface
+
+    learner.answer_with(diverged())
+    events = use_case.handle(make_market_snapshot(snapshot_id="BTC-DERIBIT:00000001"))
+
+    assert isinstance(events[0], CalibrationFailed)
+    republished = surfaces(events)[0].surface
+    assert republished.status is SurfaceStatus.STALE_REPUBLISH
+    assert republished.surface_id == good.surface_id
+
+
+def test_a_diverged_surface_is_counted_apart_from_the_gates_refusals() -> None:
+    use_case, _, _, _, metrics = make_use_case(learner=StubLearner(surface=diverged()))
+
+    use_case.handle(make_market_snapshot())
+
+    assert "neural.surface.diverged" in metrics.counter_names()
+    assert "neural.publication.refused" in metrics.counter_names()
+
+
+def test_a_gate_refusal_is_not_counted_as_a_divergence() -> None:
+    """The guard on the test above: the new counter means the model broke, not the gate said no."""
+    use_case, _, _, _, metrics = make_use_case(learner=StubLearner(surface=arbitrageable()))
+
+    use_case.handle(make_market_snapshot())
+
+    assert "neural.publication.refused" in metrics.counter_names()
+    assert "neural.surface.diverged" not in metrics.counter_names()
+
+
+def test_a_diverged_surface_is_not_kept_as_the_training_state() -> None:
+    """Fine-tuning continues from the last evaluable surface, not from NaN weights.
+
+    The opposite of a gate refusal, which *is* kept (``test_a_refused_surface_is_still_kept_as_
+    the_training_state``): continuing from a diverged network would make every later step diverge.
+    """
+    learner = StubLearner()
+    use_case, _, state, _, _ = make_use_case(learner=learner)
+    use_case.handle(make_market_snapshot())
+    good = state.surface
+
+    learner.answer_with(diverged())
+    use_case.handle(make_market_snapshot(snapshot_id="BTC-DERIBIT:00000001"))
+    learner.answer_with(FlatVolSurface())
+    use_case.handle(make_market_snapshot(snapshot_id="BTC-DERIBIT:00000002"))
+
+    assert learner.calls[2][0] is good
+
+
+def test_a_restart_that_diverged_is_still_due_on_the_next_cycle() -> None:
+    """Asking and doing are two events (``TrainingState.restarted``); a diverged one is not done."""
+    clock = ManualClock(NOW)
+    learner = StubLearner()
+    use_case, _, _, _, metrics = make_use_case(
+        learner=learner,
+        clock=clock,
+        schedule=make_schedule(restart_seconds=600.0),
+        buffer=patient_buffer(),
+    )
+    use_case.handle(make_market_snapshot())
+
+    learner.answer_with(diverged())
+    clock.advance(700.0)
+    use_case.handle(later_snapshot())
+    learner.answer_with(FlatVolSurface())
+    clock.advance(1.0)
+    use_case.handle(later_snapshot(seconds=701.0))
+
+    assert learner.calls[2][0] is None
+    assert "neural.restart" in metrics.counter_names()
+
+
+def test_a_surface_that_diverges_only_where_it_is_published_is_refused() -> None:
+    """Evaluable on the gate's mesh, NaN at a tenor the snapshot quotes and the mesh does not.
+
+    The second of the two places ``SurfaceEvaluationError`` can come from: the publication rather
+    than the judgement. The gauges prove the gate ran and passed, so the refusal below is the
+    publication's.
+    """
+    far_beyond_the_mesh = 0.5
+    surface = CallableSurface(fn=lambda k, t: np.where(t < 0.3, 0.65 * 0.65 * t, np.nan))
+    use_case, _, _, _, metrics = make_use_case(learner=StubLearner(surface=surface))
+    snapshot = make_market_snapshot(
+        tenors=(
+            (datetime(2026, 8, 27, 8, 0, tzinfo=UTC), 1.0 / 12.0),
+            (datetime(2027, 1, 27, 8, 0, tzinfo=UTC), far_beyond_the_mesh),
+        )
+    )
+
+    events = use_case.handle(snapshot)
+
+    assert metrics.gauge_value("neural.butterfly_violation") == 0.0
+    assert "diverged" in failures(events)[0].reason
+    assert not surfaces(events)

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import csv
 from datetime import UTC, datetime, timedelta
+from importlib.util import find_spec
 from pathlib import Path
 from typing import ClassVar
 
@@ -26,6 +27,7 @@ from typer.testing import CliRunner
 
 from tests.entrypoints.builders import CONFIG_TOML, replacing, write_config
 from volengine.entrypoints import cli
+from volengine.entrypoints import config as config_module
 from volengine.entrypoints.cli import app
 from volengine.entrypoints.config import AppConfig
 from volengine.entrypoints.pipeline import Adapters
@@ -442,3 +444,28 @@ def test_a_metrics_file_that_cannot_be_written_is_a_configuration_error(tmp_path
 
     assert code == 2
     assert "metrics: cannot write" in output
+
+
+# --- the neural producer by name (F3-W2)
+
+NEURAL_EXAMPLE = Path(__file__).resolve().parents[2] / "examples" / "svi-scipy-vs-mlp-torch.toml"
+
+
+def test_the_neural_producer_is_selectable_and_refused_with_the_remedy_without_its_extra(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--calibrators mlp-torch`` narrows to the network, and without torch exits 2 naming it.
+
+    The narrowing is accepted -- the name is in the file's list -- and the refusal comes from the
+    learner's factory, at start-up, as a message rather than a traceback.
+    """
+    monkeypatch.setattr(
+        config_module, "find_spec", lambda name: None if name == "torch" else find_spec(name)
+    )
+
+    code, output = invoke(
+        "report", "--config", str(NEURAL_EXAMPLE), "--calibrators", "mlp-torch", "--no-metrics"
+    )
+
+    assert code == cli.CONFIG_EXIT_CODE
+    assert "uv sync --extra neural" in output

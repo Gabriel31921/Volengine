@@ -23,6 +23,7 @@ import threading
 from collections.abc import AsyncIterator, Mapping, Sequence
 from datetime import datetime, time, timedelta
 from pathlib import Path
+from time import monotonic
 from time import sleep as thread_sleep
 
 from tests.market_data.builders import FORWARD, NEAR, NOW, make_instrument, make_update
@@ -32,6 +33,7 @@ from volengine.entrypoints.config import (
     AppConfig,
     CalibrationConfig,
     MarketConfig,
+    NeuralConfig,
     RiskConfig,
     SyntheticSettings,
 )
@@ -48,6 +50,9 @@ from volengine.market_data.domain.market_conventions import (
 from volengine.market_data.domain.option_quote import InstrumentId, OptionKindD, QuoteUpdate
 from volengine.market_data.domain.ports import MarketDataProvider
 from volengine.market_data.domain.snapshot_policy import SnapshotPolicyConfig
+from volengine.neural_surface.application.train_on_snapshot import GateThresholds, TrainingSchedule
+from volengine.neural_surface.domain.invariants import ArbitrageMesh
+from volengine.neural_surface.domain.replay_buffer import StratificationSpec
 from volengine.parametric_pricing.adapters.scipy_calibrator import FitSettings
 from volengine.parametric_pricing.application.calibrate_on_snapshot import Acceptance
 from volengine.parametric_pricing.domain.calibration import CalibrationResult, CalibrationTask
@@ -199,16 +204,80 @@ def make_risk_config(
     )
 
 
+GATE_MESH_K = tuple(-0.60 + 0.05 * step for step in range(25))
+"""A uniform moneyness axis from -60% to +60%, wider than the published grid on both sides."""
+
+
+def make_neural_config(
+    tenors: tuple[float, ...] = (1.0 / 12.0, 3.0 / 12.0),
+    log_moneyness: tuple[float, ...] = GATE_MESH_K,
+    butterfly: float = 1e-3,
+    calendar: float = 1e-3,
+    restart_seconds: float | None = None,
+    seed: int = 20261004,
+) -> NeuralConfig:
+    """A ``[neural]`` with no optional sub-table, so it builds on an installation without torch.
+
+    The gate is generous: what the composition-root tests need is a network's surface *arriving*,
+    and the tolerance a deployment draws is the example file's business. Restarts are off, so a
+    test running under a manual clock never retrains from scratch on an arbitrary tick.
+    """
+    return NeuralConfig(
+        buffer=StratificationSpec(
+            moneyness_edges=(-0.4, -0.1, 0.1, 0.4),
+            tenor_edges=(0.02, 0.1, 0.5),
+            capacity_per_cell=16,
+            max_age_seconds=600.0,
+        ),
+        mesh=ArbitrageMesh(log_moneyness=log_moneyness, tenors=tenors),
+        gate=GateThresholds(butterfly=butterfly, calendar=calendar),
+        schedule=TrainingSchedule(replay_size=8, restart_seconds=restart_seconds),
+        seed=seed,
+    )
+
+
 def make_app_config(
     markets: tuple[MarketConfig, ...] | None = None,
     calibration: CalibrationConfig | None = None,
     risk: RiskConfig | None = None,
+    neural: NeuralConfig | None = None,
 ) -> AppConfig:
     return AppConfig(
         markets=(make_market_config(),) if markets is None else markets,
         calibration=make_calibration_config() if calibration is None else calibration,
         risk=make_risk_config() if risk is None else risk,
+        neural=neural,
     )
+
+
+class SteadyClock:
+    """Real elapsed time that never steps backwards: ``SystemClock`` read off the monotonic clock.
+
+    For the end-to-end tests that need time to really pass -- a finite feed sleeping between
+    cycles, a fit really running on its pool -- without trusting the host's wall clock to only
+    move forward. It does not: measured on the WSL2 host these tests are developed on, the wall
+    clock is stepped back by about 2.6 s every thirty seconds by the host's time sync. A session
+    of a tenth of a second that straddles one sees ``now()`` fall behind its last snapshot, the
+    snapshot policy reads that as "the cadence has not elapsed" (``SnapshotPolicy.cadence_elapsed``
+    on a clock running backwards), and nothing after the first snapshot is published -- a run that
+    fails roughly one time in three hundred, on the host and not on the code.
+
+    ``now()`` is ``start`` plus the monotonic time elapsed since construction, so it agrees with
+    the wall clock at the instant the test reads it and then advances at the same rate, steps
+    excluded. ``sleep`` really waits, like ``SystemClock``'s.
+    """
+
+    def __init__(self, start: datetime) -> None:
+        if start.tzinfo is None:
+            raise ValueError(f"The start must be timezone-aware, got naive {start}")
+        self._start = start
+        self._origin = monotonic()
+
+    def now(self) -> datetime:
+        return self._start + timedelta(seconds=monotonic() - self._origin)
+
+    async def sleep(self, seconds: float) -> None:
+        await asyncio.sleep(seconds)
 
 
 class SlowCalibrator(StubCalibrator):

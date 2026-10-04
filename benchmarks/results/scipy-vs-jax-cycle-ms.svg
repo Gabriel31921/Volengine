@@ -1,0 +1,73 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="380" viewBox="0 0 760 380" font-family="sans-serif" font-size="12">
+<rect width="760" height="380" fill="white"/>
+<text x="380.0" y="22" text-anchor="middle" font-size="14" font-weight="bold">Calibration cycle time (the fit alone)</text>
+<line x1="72" y1="328.0" x2="580" y2="328.0" stroke="#e5e5e5"/>
+<text x="66" y="332.0" text-anchor="end">0</text>
+<line x1="72" y1="232.0" x2="580" y2="232.0" stroke="#e5e5e5"/>
+<text x="66" y="236.0" text-anchor="end">500</text>
+<line x1="72" y1="136.0" x2="580" y2="136.0" stroke="#e5e5e5"/>
+<text x="66" y="140.0" text-anchor="end">1000</text>
+<line x1="72" y1="40.0" x2="580" y2="40.0" stroke="#e5e5e5"/>
+<text x="66" y="44.0" text-anchor="end">1500</text>
+<line x1="72.0" y1="40" x2="72.0" y2="328" stroke="#f0f0f0"/>
+<text x="72.0" y="344" text-anchor="middle">0</text>
+<line x1="173.6" y1="40" x2="173.6" y2="328" stroke="#f0f0f0"/>
+<text x="173.6" y="344" text-anchor="middle">5</text>
+<line x1="275.2" y1="40" x2="275.2" y2="328" stroke="#f0f0f0"/>
+<text x="275.2" y="344" text-anchor="middle">10</text>
+<line x1="376.8" y1="40" x2="376.8" y2="328" stroke="#f0f0f0"/>
+<text x="376.8" y="344" text-anchor="middle">15</text>
+<line x1="478.4" y1="40" x2="478.4" y2="328" stroke="#f0f0f0"/>
+<text x="478.4" y="344" text-anchor="middle">20</text>
+<line x1="580.0" y1="40" x2="580.0" y2="328" stroke="#f0f0f0"/>
+<text x="580.0" y="344" text-anchor="middle">25</text>
+<rect x="72" y="40" width="508" height="288" fill="none" stroke="#333"/>
+<text x="326.0" y="368" text-anchor="middle">seconds since the session's first measurement</text>
+<text x="16" y="184.0" text-anchor="middle" transform="rotate(-90 16 184.0)">milliseconds</text>
+<polyline points="72.1,327.5 94.1,315.3 115.1,319.5 137.3,311.9 157.8,311.6 183.4,261.7 211.2,191.1 221.1,291.1 239.2,312.6 259.2,319.7 280.2,318.7 302.2,303.2 324.3,297.5 342.5,318.1 364.1,310.3 386.2,307.1 416.3,216.0 425.8,318.7 455.5,231.9 480.5,189.4" fill="none" stroke="#1f77b4" stroke-width="1.5"/>
+<circle cx="72.1" cy="327.5" r="2.5" fill="#1f77b4"/>
+<circle cx="94.1" cy="315.3" r="2.5" fill="#1f77b4"/>
+<circle cx="115.1" cy="319.5" r="2.5" fill="#1f77b4"/>
+<circle cx="137.3" cy="311.9" r="2.5" fill="#1f77b4"/>
+<circle cx="157.8" cy="311.6" r="2.5" fill="#1f77b4"/>
+<circle cx="183.4" cy="261.7" r="2.5" fill="#1f77b4"/>
+<circle cx="211.2" cy="191.1" r="2.5" fill="#1f77b4"/>
+<circle cx="221.1" cy="291.1" r="2.5" fill="#1f77b4"/>
+<circle cx="239.2" cy="312.6" r="2.5" fill="#1f77b4"/>
+<circle cx="259.2" cy="319.7" r="2.5" fill="#1f77b4"/>
+<circle cx="280.2" cy="318.7" r="2.5" fill="#1f77b4"/>
+<circle cx="302.2" cy="303.2" r="2.5" fill="#1f77b4"/>
+<circle cx="324.3" cy="297.5" r="2.5" fill="#1f77b4"/>
+<circle cx="342.5" cy="318.1" r="2.5" fill="#1f77b4"/>
+<circle cx="364.1" cy="310.3" r="2.5" fill="#1f77b4"/>
+<circle cx="386.2" cy="307.1" r="2.5" fill="#1f77b4"/>
+<circle cx="416.3" cy="216.0" r="2.5" fill="#1f77b4"/>
+<circle cx="425.8" cy="318.7" r="2.5" fill="#1f77b4"/>
+<circle cx="455.5" cy="231.9" r="2.5" fill="#1f77b4"/>
+<circle cx="480.5" cy="189.4" r="2.5" fill="#1f77b4"/>
+<line x1="594" y1="50" x2="612" y2="50" stroke="#1f77b4" stroke-width="2"/>
+<text x="618" y="54">svi-scipy</text>
+<polyline points="73.4,315.0 93.6,321.1 119.2,281.2 139.6,290.2 171.6,182.7 190.8,191.4 209.4,208.9 226.6,239.0 250.4,208.0 266.7,249.3 294.6,182.9 303.9,286.4 333.4,211.5 342.4,319.6 365.7,295.6 406.7,114.4 415.0,250.9 428.9,290.0 459.4,196.4 471.7,273.5" fill="none" stroke="#d62728" stroke-width="1.5"/>
+<circle cx="73.4" cy="315.0" r="2.5" fill="#d62728"/>
+<circle cx="93.6" cy="321.1" r="2.5" fill="#d62728"/>
+<circle cx="119.2" cy="281.2" r="2.5" fill="#d62728"/>
+<circle cx="139.6" cy="290.2" r="2.5" fill="#d62728"/>
+<circle cx="171.6" cy="182.7" r="2.5" fill="#d62728"/>
+<circle cx="190.8" cy="191.4" r="2.5" fill="#d62728"/>
+<circle cx="209.4" cy="208.9" r="2.5" fill="#d62728"/>
+<circle cx="226.6" cy="239.0" r="2.5" fill="#d62728"/>
+<circle cx="250.4" cy="208.0" r="2.5" fill="#d62728"/>
+<circle cx="266.7" cy="249.3" r="2.5" fill="#d62728"/>
+<circle cx="294.6" cy="182.9" r="2.5" fill="#d62728"/>
+<circle cx="303.9" cy="286.4" r="2.5" fill="#d62728"/>
+<circle cx="333.4" cy="211.5" r="2.5" fill="#d62728"/>
+<circle cx="342.4" cy="319.6" r="2.5" fill="#d62728"/>
+<circle cx="365.7" cy="295.6" r="2.5" fill="#d62728"/>
+<circle cx="406.7" cy="114.4" r="2.5" fill="#d62728"/>
+<circle cx="415.0" cy="250.9" r="2.5" fill="#d62728"/>
+<circle cx="428.9" cy="290.0" r="2.5" fill="#d62728"/>
+<circle cx="459.4" cy="196.4" r="2.5" fill="#d62728"/>
+<circle cx="471.7" cy="273.5" r="2.5" fill="#d62728"/>
+<line x1="594" y1="68" x2="612" y2="68" stroke="#d62728" stroke-width="2"/>
+<text x="618" y="72">svi-jax</text>
+</svg>
